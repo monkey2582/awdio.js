@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
  * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
- * @version 3.5.0
+ * @version 3.6.0
  */
 (function (root, factory) {
   if (typeof define === 'function' && define.amd) {
@@ -371,6 +371,7 @@ class Awdio {
       this._formula = this._type;
     }
     this._freq = opts.freq || 440;
+    this._duration = opts.duration != null ? opts.duration : 2;
     this._volume = opts.volume != null ? opts.volume : 100;
     this._loop = opts.loop != null ? opts.loop : (!!this._type);
     this._poly = opts.poly || false;
@@ -665,7 +666,8 @@ class Awdio {
    * 统一入口：根据 type 创建缓冲区
    * 支持函数（公式）、注册的公式名、内置波形类型
    */
-  _createBuffer(type, freq, duration = 2) {
+  _createBuffer(type, freq, duration) {
+    if (duration === undefined) duration = this._duration || 2;
     // 1. 函数类型 → 直接作为公式
     if (typeof type === 'function') {
       return this._createFormulaBuffer(type, freq, duration);
@@ -1118,6 +1120,13 @@ class Awdio {
         this._buffer = this._createBuffer(arg.type, this._freq);
       }
       if (arg.freq !== undefined) this._freq = arg.freq;
+      if (arg.duration !== undefined) {
+        this._duration = arg.duration;
+        // 如果当前是合成音频（非 src 加载），重新生成 buffer
+        if (!this._src && (this._formula || this._type)) {
+          this._buffer = this._createBuffer(this._formula || this._type, this._freq);
+        }
+      }
       if (arg.volume !== undefined) this._volume = Math.max(0, Math.min(100, arg.volume));
       if (arg.loop !== undefined) this._loop = arg.loop;
       if (arg.poly !== undefined) this._poly = arg.poly;
@@ -1224,6 +1233,7 @@ class Awdio {
       formula: this._formula,
       type: this._type,
       freq: this._freq,
+      duration: this._duration,
       volume: this._volume,
       loop: this._loop,
       poly: this._poly,
@@ -1272,7 +1282,17 @@ class Awdio {
   }
 
   get duration() {
+    if (this._formula || this._type) {
+      return this._duration;
+    }
     return this._buffer ? this._buffer.duration : 0;
+  }
+
+  set duration(sec) {
+    this._duration = Math.max(0.01, sec);
+    if (!this._src && (this._formula || this._type)) {
+      this._buffer = this._createBuffer(this._formula || this._type, this._freq);
+    }
   }
 
   get playing() {

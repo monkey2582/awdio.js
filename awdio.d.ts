@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
  * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
- * @version 3.5.0
+ * @version 3.6.0
  */
 
 declare class Awdio {
@@ -207,8 +207,8 @@ declare class Awdio {
   volume: number;
   /** 当前播放时间（秒） */
   currentTime: number;
-  /** 音频时长（秒） */
-  readonly duration: number;
+  /** 音频时长（秒），合成音频可写 */
+  duration: number;
   /** 是否正在播放 */
   readonly playing: boolean;
 
@@ -413,6 +413,8 @@ interface AwdioOptions {
   type?: AwdioWaveType | ((t: number, freq: number, sr: number, opts: Readonly<AwdioOptions>) => number);
   /** 合成音频频率 (Hz) */
   freq?: number;
+  /** 合成音频时长（秒，默认 2） */
+  duration?: number;
   /** 音量（百分制，0-100） */
   volume?: number;
   /** 是否循环 */
