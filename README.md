@@ -2,9 +2,9 @@
 
 轻量级 Web Audio 音频库 —— 合成、公式、3D 空间、效果链、队列/并行播放，全链式调用。
 
-![https://img.shields.io/badge/version-3.5.0-blue]
-![https://img.shields.io/badge/license-MIT-green]
-![https://img.shields.io/badge/minified-~20KB-brightgreen]
+![version-3.5.0](https://img.shields.io/badge/version-3.5.0-blue)
+![MIT](https://img.shields.io/badge/license-MIT-green)
+![minified-32KB](https://img.shields.io/badge/minified-~32KB-brightgreen)
 
 ---
 
