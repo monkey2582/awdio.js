@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
  * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
- * @version 3.6.0
+ * @version 3.9.0
  */
 (function (root, factory) {
   if (typeof define === 'function' && define.amd) {
@@ -28,7 +28,7 @@ class Awdio {
   /** 已知波形类型列表 */
   static _waveTypes = [
     // 基础波形
-    'sine', 'square', 'sawtooth', 'triangle', 'noise',
+    'sine', 'square', 'sawtooth', 'triangle', 'noise', 'pink',
     'cosine', 'tan', 'pulse',
     // 乐器模拟
     'organ', 'bell', 'guitar', 'piano', 'strings', 'brass', 'flute',
@@ -36,7 +36,7 @@ class Awdio {
     // 管乐器
     'clarinet', 'oboe', 'bassoon', 'trumpet', 'trombone', 'tuba',
     // 打击乐
-    'kick', 'snare', 'hihat', 'pluck',
+    'kick', 'snare', 'hihat', 'pluck', 'perc',
     'tom', 'clap', 'crash', 'ride', 'cowbell', 'rimshot',
     // FM 合成
     'epiano', 'fm_bell', 'fm_bass', 'fm_lead',
@@ -80,12 +80,12 @@ class Awdio {
   static async getAllDevices() {
     // 先请求权限（getUserMedia 触发 enumerateDevices 返回完整标签）
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      let stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       stream.getTracks().forEach(t => t.stop());
     } catch (e) {
       // 权限被拒，仍可枚举但 label 可能为空
     }
-    const devices = await navigator.mediaDevices.enumerateDevices();
+    let devices = await navigator.mediaDevices.enumerateDevices();
     return devices
       .filter(d => d.kind === 'audiooutput')
       .map(d => ({ deviceId: d.deviceId, label: d.label, groupId: d.groupId }));
@@ -99,7 +99,7 @@ class Awdio {
    *   无参：  Awdio.setGlobalOutput() → 恢复默认
    */
   static async setGlobalOutput(deviceId) {
-    const ctx = Awdio.getContext();
+    let ctx = Awdio.getContext();
 
     // 清理旧的多设备输出
     if (Awdio._multiOutputNodes) {
@@ -123,16 +123,16 @@ class Awdio {
       Awdio._outputDeviceId = deviceId;
       Awdio._multiOutputNodes = [];
 
-      const gainNode = Awdio.getGlobalGainNode();
+      let gainNode = Awdio.getGlobalGainNode();
       gainNode.disconnect();
       gainNode.connect(ctx.destination); // 保留默认输出
 
-      for (const id of deviceId) {
+      for (let id of deviceId) {
         if (id === 'default') continue; // 默认已连
-        const destNode = ctx.createMediaStreamDestination();
+        let destNode = ctx.createMediaStreamDestination();
         gainNode.connect(destNode);
 
-        const audioEl = document.createElement('audio');
+        let audioEl = document.createElement('audio');
         audioEl.muted = false;
         audioEl.autoplay = true;
         audioEl.srcObject = destNode.stream;
@@ -169,12 +169,12 @@ class Awdio {
   }
 
   static getOption(name) {
-    const inst = Awdio._instances.get(name);
+    let inst = Awdio._instances.get(name);
     return inst ? inst.getOption() : null;
   }
 
   static destroy(name) {
-    const inst = Awdio._instances.get(name);
+    let inst = Awdio._instances.get(name);
     if (inst) inst.destroy();
   }
 
@@ -195,6 +195,16 @@ class Awdio {
   }
 
   /**
+   * MIDI 音符转频率
+   * @param {number} note - MIDI 音符编号（69=A4=440Hz）
+   * @returns {number} 频率 (Hz)
+   * 示例：Awdio.midicps(69) → 440，Awdio.midicps(60) → 261.63 (C4)
+   */
+  static midicps(note) {
+    return 440 * Math.pow(2, (note - 69) / 12);
+  }
+
+  /**
    * 设置 3D 空间音频监听者位置/朝向
    * @param {object} opts
    *   opts.x, opts.y, opts.z          - 监听者位置
@@ -202,8 +212,8 @@ class Awdio {
    *   opts.upX, opts.upY, opts.upZ    - 上方向量
    */
   static listener(opts) {
-    const ctx = Awdio.getContext();
-    const l = ctx.listener;
+    let ctx = Awdio.getContext();
+    let l = ctx.listener;
     if (opts.x != null) { l.positionX.value = opts.x; }
     if (opts.y != null) { l.positionY.value = opts.y; }
     if (opts.z != null) { l.positionZ.value = opts.z; }
@@ -230,7 +240,7 @@ class Awdio {
   static _parseTime(time) {
     if (typeof time === 'number') return Math.max(0, time);
     if (typeof time === 'string') {
-      const parts = time.split(':').map(Number);
+      let parts = time.split(':').map(Number);
       if (parts.length === 1) return Math.max(0, parts[0]);
       if (parts.length === 2) return Math.max(0, parts[0] * 60 + parts[1]);
       if (parts.length === 3) return Math.max(0, parts[0] * 3600 + parts[1] * 60 + parts[2]);
@@ -242,7 +252,7 @@ class Awdio {
     if (item instanceof Awdio) return item;
     if (typeof item === 'function') return new Awdio({ type: item });
     if (typeof item === 'string') {
-      const existing = Awdio._instances.get(item);
+      let existing = Awdio._instances.get(item);
       if (existing) return existing;
       return new Awdio(item);
     }
@@ -252,58 +262,127 @@ class Awdio {
     return null;
   }
 
-  static queue(...args) {
-    let items, opts = {};
+  /**
+   * 解析混合参数列表（实例 + 延迟数字）
+   * 返回 [{ item, delayAfter }] 和全局 opts
+   */
+  static _parseQueueArgs(args) {
+    let opts = {};
+    let raw = [...args];
 
-    if (Array.isArray(args[0])) {
-      items = args[0];
-      if (args[1] && typeof args[1] === 'object' && !Array.isArray(args[1])) {
-        opts = args[1];
-      }
-    } else {
-      const last = args[args.length - 1];
-      if (last && typeof last === 'object' && !Array.isArray(last) && !(last instanceof Awdio) && typeof last !== 'function') {
-        const hasQueueOpts = ['loop', 'delay', 'fade', 'fadeIn', 'fadeOut', 'fadeDuration', 'fadeInDuration', 'fadeOutDuration', 'autoplay'].some(k => k in last);
-        if (hasQueueOpts) {
-          opts = args.pop();
-          items = args;
-        } else {
-          items = args;
-        }
-      } else {
-        items = args;
+    // 末尾是选项对象则提取
+    let last = raw[raw.length - 1];
+    if (last && typeof last === 'object' && !Array.isArray(last) && !(last instanceof Awdio) && typeof last !== 'function') {
+      let hasQueueOpts = ['loop', 'delay', 'fade', 'fadeIn', 'fadeOut', 'fadeDuration', 'fadeInDuration', 'fadeOutDuration', 'autoplay'].some(k => k in last);
+      if (hasQueueOpts) {
+        opts = raw.pop();
       }
     }
 
-    const instances = items.map(item => Awdio._resolve(item)).filter(Boolean);
-    return new _AwdioManager(instances, opts, 'sequential');
+    let entries = [];
+    let pendingDelay = 0;
+
+    for (let val of raw) {
+      if (typeof val === 'number') {
+        pendingDelay += val;
+      } else {
+        let inst = Awdio._resolve(val);
+        if (inst) {
+          entries.push({ item: inst, delayAfter: pendingDelay });
+          pendingDelay = 0;
+        }
+      }
+    }
+
+    // 剩余数字作为末尾延迟
+    if (pendingDelay > 0) {
+      entries.push({ item: null, delayAfter: pendingDelay });
+    }
+
+    return { entries, opts };
+  }
+
+  static queue(...args) {
+    let entries, opts = {};
+
+    if (Array.isArray(args[0])) {
+      // 数组形式：支持逐项数字延迟 [aw1, 200, aw2, 100, aw3]
+      // 数字跟在 item 后面表示该 item 的逐项延迟，叠加到全局 delay
+      let raw = args[0];
+      if (args[1] && typeof args[1] === 'object' && !Array.isArray(args[1])) {
+        opts = args[1];
+      }
+
+      let globalDelay = opts.delay || 0;
+      entries = [];
+      let pendingDelay = 0;
+
+      for (let val of raw) {
+        if (typeof val === 'number') {
+          pendingDelay += val;
+        } else {
+          let inst = Awdio._resolve(val);
+          if (inst) {
+            entries.push({ item: inst, delayAfter: pendingDelay + globalDelay });
+            pendingDelay = 0;
+          }
+        }
+      }
+      // 末尾数字
+      if (pendingDelay > 0) {
+        entries.push({ item: null, delayAfter: pendingDelay + globalDelay });
+      }
+    } else {
+      // 扁平形式：awdio.queue(100, aw1, 200, aw2, 300)
+      let parsed = Awdio._parseQueueArgs(args);
+      entries = parsed.entries;
+      opts = parsed.opts;
+    }
+
+    let instances = entries.filter(e => e.item).map(e => e.item);
+    let mgr = new _AwdioManager(instances, opts, 'sequential');
+    // 注入逐项延迟
+    mgr._perItemDelays = entries.map(e => e.delayAfter);
+    return mgr;
   }
 
   static playAll(...args) {
-    let items, opts = {};
+    let entries, opts = {};
 
     if (Array.isArray(args[0])) {
-      items = args[0];
+      let raw = args[0];
       if (args[1] && typeof args[1] === 'object' && !Array.isArray(args[1])) {
         opts = args[1];
       }
-    } else {
-      const last = args[args.length - 1];
-      if (last && typeof last === 'object' && !Array.isArray(last) && !(last instanceof Awdio) && typeof last !== 'function') {
-        const hasOpts = ['loop', 'fade', 'fadeIn', 'fadeOut', 'fadeDuration', 'fadeInDuration', 'fadeOutDuration', 'autoplay'].some(k => k in last);
-        if (hasOpts) {
-          opts = args.pop();
-          items = args;
+
+      let globalDelay = opts.delay || 0;
+      entries = [];
+      let pendingDelay = 0;
+
+      for (let val of raw) {
+        if (typeof val === 'number') {
+          pendingDelay += val;
         } else {
-          items = args;
+          let inst = Awdio._resolve(val);
+          if (inst) {
+            entries.push({ item: inst, delayAfter: pendingDelay + globalDelay });
+            pendingDelay = 0;
+          }
         }
-      } else {
-        items = args;
       }
+      if (pendingDelay > 0) {
+        entries.push({ item: null, delayAfter: pendingDelay + globalDelay });
+      }
+    } else {
+      let parsed = Awdio._parseQueueArgs(args);
+      entries = parsed.entries;
+      opts = parsed.opts;
     }
 
-    const instances = items.map(item => Awdio._resolve(item)).filter(Boolean);
-    return new _AwdioManager(instances, opts, 'parallel');
+    let instances = entries.filter(e => e.item).map(e => e.item);
+    let mgr = new _AwdioManager(instances, opts, 'parallel');
+    mgr._perItemDelays = entries.map(e => e.delayAfter);
+    return mgr;
   }
 
   // ==================== 构造函数 ====================
@@ -339,6 +418,12 @@ class Awdio {
     this._chorusWet = null;
     this._chorusDelay = null;
     this._chorusLFO = null;
+    this._waveshaperNode = null;
+    this._phaserNode = null;
+    this._phaserDry = null;
+    this._phaserWet = null;
+    this._phaserLFOs = null;
+    this._stereoPanner = null;
     this._pannerNode = null;
 
     // 解析参数：支持函数作为 formula
@@ -383,6 +468,12 @@ class Awdio {
     this._fadeDuration = opts.fadeDuration || 1;
     this._fadeInDuration = opts.fadeInDuration || opts.fadeDuration || 1;
     this._fadeOutDuration = opts.fadeOutDuration || opts.fadeDuration || 1;
+    this._speed = opts.speed != null ? Math.max(0.1, Math.min(10, opts.speed)) : 1;
+    this._pitch = opts.pitch != null ? Math.max(0.1, Math.min(10, opts.pitch)) : 1;
+    this._reverse = opts.reverse || false;
+    this._a = opts.a != null ? Math.max(0, opts.a) : 0.01;
+    this._r = opts.r != null ? Math.max(0, opts.r) : 0.3;
+    this._params = {}; // 通用参数存储
 
     // 命名
     this._name = opts.name || ('awdio_' + (++Awdio._counter));
@@ -401,6 +492,7 @@ class Awdio {
     this._isLoading = false;
     this._releasing = false;
     this._releaseTimeoutId = null;
+    this._reversedBuffer = null;
 
     // 实例级设备
     if (opts.device) {
@@ -430,6 +522,7 @@ class Awdio {
   _rebuildChain() {
     this._chainInput.disconnect();
     if (this._envelopeNode) this._envelopeNode.disconnect();
+    if (this._waveshaperNode) this._waveshaperNode.disconnect();
     if (this._filterNode) this._filterNode.disconnect();
     if (this._compNode) this._compNode.disconnect();
     if (this._compGainNode) this._compGainNode.disconnect();
@@ -440,6 +533,10 @@ class Awdio {
     if (this._chorusWet) this._chorusWet.disconnect();
     if (this._chorusDelay) this._chorusDelay.disconnect();
     if (this._chorusNode) this._chorusNode.disconnect();
+    if (this._phaserDry) this._phaserDry.disconnect();
+    if (this._phaserWet) this._phaserWet.disconnect();
+    if (this._phaserNode) this._phaserNode.disconnect();
+    if (this._stereoPanner) this._stereoPanner.disconnect();
     if (this._pannerNode) this._pannerNode.disconnect();
     this._gainNode.disconnect();
 
@@ -449,6 +546,12 @@ class Awdio {
     if (this._envelopeNode) {
       prev.connect(this._envelopeNode);
       prev = this._envelopeNode;
+    }
+
+    // 波形塑形（失真）
+    if (this._waveshaperNode) {
+      prev.connect(this._waveshaperNode);
+      prev = this._waveshaperNode;
     }
 
     if (this._filterNode) {
@@ -480,10 +583,25 @@ class Awdio {
       prev = this._chorusNode;
     }
 
+    // 移相效果
+    if (prev && this._phaserNode && this._phaserDry && this._phaserWet) {
+      prev.connect(this._phaserDry);
+      prev.connect(this._phaserWet);
+      this._phaserDry.connect(this._phaserNode);
+      this._phaserWet.connect(this._phaserNode);
+      prev = this._phaserNode;
+    }
+
     // 3D 空间定位
     if (prev && this._pannerNode) {
       prev.connect(this._pannerNode);
       prev = this._pannerNode;
+    }
+
+    // 立体声平衡（在 3D panner 之后，因为 3D 输出是单声道定位流）
+    if (prev && this._stereoPanner) {
+      prev.connect(this._stereoPanner);
+      prev = this._stereoPanner;
     }
 
     if (prev) {
@@ -497,7 +615,7 @@ class Awdio {
    * 将 _gainNode 路由到正确的输出（全局 || 实例级设备）
    */
   async _applyDeviceRouting() {
-    const ctx = this._ctx;
+    let ctx = this._ctx;
 
     // 清理旧设备输出
     if (this._deviceOutputs) {
@@ -513,15 +631,15 @@ class Awdio {
 
     if (!this._device) return;
 
-    const ids = Array.isArray(this._device) ? this._device : [this._device];
+    let ids = Array.isArray(this._device) ? this._device : [this._device];
     this._deviceOutputs = [];
 
-    for (const id of ids) {
+    for (let id of ids) {
       if (id === 'default') continue;
-      const destNode = ctx.createMediaStreamDestination();
+      let destNode = ctx.createMediaStreamDestination();
       this._gainNode.connect(destNode);
 
-      const audioEl = document.createElement('audio');
+      let audioEl = document.createElement('audio');
       audioEl.muted = false;
       audioEl.autoplay = true;
       audioEl.srcObject = destNode.stream;
@@ -604,35 +722,35 @@ class Awdio {
     try {
       let buf;
       if (Awdio._isDataURI(this._src)) {
-        const base64Match = this._src.match(/;base64,(.+)$/);
+        let base64Match = this._src.match(/;base64,(.+)$/);
         if (base64Match) {
-          const binaryStr = atob(base64Match[1]);
+          let binaryStr = atob(base64Match[1]);
           buf = new ArrayBuffer(binaryStr.length);
-          const view = new Uint8Array(buf);
+          let view = new Uint8Array(buf);
           for (let i = 0; i < binaryStr.length; i++) {
             view[i] = binaryStr.charCodeAt(i);
           }
         } else {
-          const dataMatch = this._src.match(/^data:[^,]*,/);
+          let dataMatch = this._src.match(/^data:[^,]*,/);
           if (dataMatch) {
-            const text = this._src.slice(dataMatch[0].length);
-            const encoder = new TextEncoder();
+            let text = this._src.slice(dataMatch[0].length);
+            let encoder = new TextEncoder();
             buf = encoder.encode(text).buffer;
           } else {
             throw new Error('无法解析 data URI');
           }
         }
       } else {
-        const resp = await fetch(this._src);
+        let resp = await fetch(this._src);
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         // 流式读取 + 进度回调
-        const contentLength = resp.headers.get('content-length');
-        const total = contentLength ? parseInt(contentLength, 10) : 0;
-        const reader = resp.body.getReader();
-        const chunks = [];
+        let contentLength = resp.headers.get('content-length');
+        let total = contentLength ? parseInt(contentLength, 10) : 0;
+        let reader = resp.body.getReader();
+        let chunks = [];
         let loaded = 0;
         while (true) {
-          const { done, value } = await reader.read();
+          let { done, value } = await reader.read();
           if (done) break;
           chunks.push(value);
           loaded += value.length;
@@ -642,9 +760,9 @@ class Awdio {
         }
         // 合并 chunks
         buf = new ArrayBuffer(loaded);
-        const view = new Uint8Array(buf);
+        let view = new Uint8Array(buf);
         let pos = 0;
-        for (const chunk of chunks) {
+        for (let chunk of chunks) {
           view.set(chunk, pos);
           pos += chunk.length;
         }
@@ -684,13 +802,13 @@ class Awdio {
    * 公式缓冲区：逐采样点调用 fn(t, freq, sr, opts)
    */
   _createFormulaBuffer(fn, freq, duration) {
-    const sr = this._ctx.sampleRate;
-    const len = Math.floor(sr * duration);
-    const buffer = this._ctx.createBuffer(1, len, sr);
-    const data = buffer.getChannelData(0);
-    const opts = this.getOption();
+    let sr = this._ctx.sampleRate;
+    let len = Math.floor(sr * duration);
+    let buffer = this._ctx.createBuffer(1, len, sr);
+    let data = buffer.getChannelData(0);
+    let opts = this.getOption();
     for (let i = 0; i < len; i++) {
-      const t = i / sr;
+      let t = i / sr;
       let val = fn(t, freq, sr, opts);
       data[i] = Math.max(-1, Math.min(1, val));
     }
@@ -698,25 +816,25 @@ class Awdio {
   }
 
   _createSyntheticBuffer(type, freq, duration = 2) {
-    const sr = this._ctx.sampleRate;
-    const len = Math.floor(sr * duration);
-    const buffer = this._ctx.createBuffer(1, len, sr);
-    const data = buffer.getChannelData(0);
+    let sr = this._ctx.sampleRate;
+    let len = Math.floor(sr * duration);
+    let buffer = this._ctx.createBuffer(1, len, sr);
+    let data = buffer.getChannelData(0);
 
     // Karplus-Strong 类型
     if (type === 'guitar' || type === 'pluck' || type === 'harp' || type === 'marimba' || type === 'vibraphone') {
-      const decayMap = { guitar: 0.996, pluck: 0.99, harp: 0.997, marimba: 0.998, vibraphone: 0.999 };
-      const decay = decayMap[type] || 0.99;
-      const ksData = this._karplusStrong(freq, sr, duration, decay);
+      let decayMap = { guitar: 0.996, pluck: 0.99, harp: 0.997, marimba: 0.998, vibraphone: 0.999 };
+      let decay = decayMap[type] || 0.99;
+      let ksData = this._karplusStrong(freq, sr, duration, decay);
       if (ksData === 0) {
         for (let i = 0; i < len; i++) data[i] = Math.sin(2 * Math.PI * freq * i / sr);
       } else {
-        const ksLen = Math.min(ksData.length, len);
+        let ksLen = Math.min(ksData.length, len);
         for (let i = 0; i < ksLen; i++) data[i] = ksData[i];
       }
       if (type === 'vibraphone') {
         for (let i = 0; i < len; i++) {
-          const t = i / sr;
+          let t = i / sr;
           data[i] *= (1 + 0.003 * Math.sin(2 * Math.PI * 6 * t));
         }
       }
@@ -724,8 +842,8 @@ class Awdio {
     }
 
     for (let i = 0; i < len; i++) {
-      const t = i / sr;
-      const phase = (freq * t) % 1;
+      let t = i / sr;
+      let phase = (freq * t) % 1;
       let sample = 0;
 
       switch (type) {
@@ -747,6 +865,19 @@ class Awdio {
           break;
         case 'noise':
           sample = Math.random() * 2 - 1;
+          break;
+        case 'pink':
+          // 粉红噪声：每八度能量递减，用 Voss-McCartney 算法
+          this._pinkState = this._pinkState || { b0: 0, b1: 0, b2: 0, b3: 0, b4: 0, b5: 0, b6: 0 };
+          let white = Math.random() * 2 - 1;
+          this._pinkState.b0 = 0.99886 * this._pinkState.b0 + white * 0.0555179;
+          this._pinkState.b1 = 0.99332 * this._pinkState.b1 + white * 0.0750759;
+          this._pinkState.b2 = 0.96900 * this._pinkState.b2 + white * 0.1538520;
+          this._pinkState.b3 = 0.86650 * this._pinkState.b3 + white * 0.3104856;
+          this._pinkState.b4 = 0.55000 * this._pinkState.b4 + white * 0.5329522;
+          this._pinkState.b5 = -0.7616 * this._pinkState.b5 - white * 0.0168980;
+          sample = (this._pinkState.b0 + this._pinkState.b1 + this._pinkState.b2 + this._pinkState.b3 + this._pinkState.b4 + this._pinkState.b5 + this._pinkState.b6 + white * 0.5362) * 0.11;
+          this._pinkState.b6 = white * 0.115926;
           break;
         case 'tan':
           sample = Math.tan(2 * Math.PI * freq * t);
@@ -777,8 +908,8 @@ class Awdio {
           break;
         case 'violin':
         case 'cello':
-          const vibFreq = type === 'violin' ? 5 : 3;
-          const vibDepth = type === 'violin' ? 0.003 : 0.002;
+          let vibFreq = type === 'violin' ? 5 : 3;
+          let vibDepth = type === 'violin' ? 0.003 : 0.002;
           sample = (2 * (phase - 0.5) * 0.6 + Math.sin(2 * Math.PI * freq * 2 * t) * 0.25 + Math.sin(2 * Math.PI * freq * 3 * t) * 0.15) * (1 + vibDepth * Math.sin(2 * Math.PI * vibFreq * t));
           break;
 
@@ -793,7 +924,7 @@ class Awdio {
           sample = (Math.sin(2 * Math.PI * freq * t) * 0.4 + Math.sin(4 * Math.PI * freq * t) * 0.3 + Math.sin(6 * Math.PI * freq * t) * 0.2 + Math.sin(8 * Math.PI * freq * t) * 0.1) * (1 + 0.002 * Math.sin(2 * Math.PI * 3 * t));
           break;
         case 'trumpet':
-          const tpEnv = Math.min(1, t * 20);
+          let tpEnv = Math.min(1, t * 20);
           sample = tpEnv * ((phase < 0.5 ? 1 : -1) * 0.5 + Math.sin(2 * Math.PI * freq * 2 * t) * 0.3 + Math.sin(2 * Math.PI * freq * 3 * t) * 0.15 + Math.sin(2 * Math.PI * freq * 4 * t) * 0.05);
           break;
         case 'trombone':
@@ -812,6 +943,10 @@ class Awdio {
           break;
         case 'hihat':
           sample = (Math.random() * 2 - 1) * Math.exp(-t * 20);
+          break;
+        case 'perc':
+          // 通用打击乐：白噪声包络 + 正弦混合
+          sample = ((Math.random() * 2 - 1) * 0.6 + Math.sin(2 * Math.PI * freq * 1.5 * t) * 0.4) * Math.exp(-t * 10);
           break;
         case 'tom':
           sample = (Math.sin(2 * Math.PI * Math.max(30, freq * (1 - t * 3)) * t) * 0.6 + (Math.random() * 2 - 1) * 0.1) * Math.exp(-t * 6);
@@ -859,7 +994,7 @@ class Awdio {
         case 'supersaw':
           sample = 0;
           for (let d = -3; d <= 3; d++) {
-            const dp = (freq * (1 + d * 0.008) * t) % 1;
+            let dp = (freq * (1 + d * 0.008) * t) % 1;
             sample += (2 * (dp - 0.5)) * (1 - Math.abs(d) * 0.15);
           }
           sample *= 0.2;
@@ -891,12 +1026,12 @@ class Awdio {
   }
 
   _karplusStrong(freq, sr, duration, decay) {
-    const period = Math.floor(sr / freq);
+    let period = Math.floor(sr / freq);
     if (period < 2) return 0;
-    const len = Math.floor(sr * duration);
-    const noise = new Float32Array(period);
+    let len = Math.floor(sr * duration);
+    let noise = new Float32Array(period);
     for (let i = 0; i < period; i++) noise[i] = (Math.random() * 2 - 1) * 0.5;
-    const out = new Float32Array(len);
+    let out = new Float32Array(len);
     for (let i = 0; i < len; i++) {
       out[i] = i < period ? noise[i] : (out[i - period] + out[i - period + 1]) * 0.5 * decay;
     }
@@ -904,6 +1039,28 @@ class Awdio {
   }
 
   // ==================== 内部播放 ====================
+
+  _getReversedBuffer() {
+    if (!this._buffer) return null;
+    if (this._reversedBuffer && this._reversedBuffer._srcBuffer === this._buffer) {
+      return this._reversedBuffer;
+    }
+    let orig = this._buffer;
+    let numChannels = orig.numberOfChannels;
+    let len = orig.length;
+    let sr = orig.sampleRate;
+    let reversed = this._ctx.createBuffer(numChannels, len, sr);
+    for (let ch = 0; ch < numChannels; ch++) {
+      let origData = orig.getChannelData(ch);
+      let revData = reversed.getChannelData(ch);
+      for (let i = 0; i < len; i++) {
+        revData[i] = origData[len - 1 - i];
+      }
+    }
+    reversed._srcBuffer = this._buffer;
+    this._reversedBuffer = reversed;
+    return reversed;
+  }
 
   _play() {
     if (this._destroyed) return;
@@ -919,12 +1076,13 @@ class Awdio {
       this._stopAllSources();
     }
 
-    const source = this._ctx.createBufferSource();
-    source.buffer = this._buffer;
+    let source = this._ctx.createBufferSource();
+    source.buffer = this._reverse ? this._getReversedBuffer() : this._buffer;
     source.loop = this._loop;
+    source.playbackRate.value = this._speed * this._pitch;
     source.connect(this._chainInput);
 
-    const now = this._ctx.currentTime;
+    let now = this._ctx.currentTime;
 
     // ADSR 包络调度
     if (this._envelopeNode && this._envelope) {
@@ -943,7 +1101,7 @@ class Awdio {
       );
     }
 
-    const offset = this._pausedAt != null ? this._pausedAt : 0;
+    let offset = this._pausedAt != null ? this._pausedAt : 0;
     source.start(0, offset);
     source.__startTime = this._ctx.currentTime - offset;
 
@@ -952,8 +1110,8 @@ class Awdio {
 
     this._emit('play', { source });
 
-    const onEnd = () => {
-      const idx = this._activeSources.indexOf(source);
+    let onEnd = () => {
+      let idx = this._activeSources.indexOf(source);
       if (idx !== -1) this._activeSources.splice(idx, 1);
       try { source.disconnect(); } catch (e) {}
       if (this._activeSources.length === 0) {
@@ -967,6 +1125,33 @@ class Awdio {
   }
 
   _pauseInternal() {
+    // 淡出暂停
+    if (this._fadeOut && this._activeSources.length > 0) {
+      let now = this._ctx.currentTime;
+      this._gainNode.gain.cancelScheduledValues(now);
+      this._gainNode.gain.setValueAtTime(this._gainNode.gain.value, now);
+      this._gainNode.gain.linearRampToValueAtTime(0, now + this._fadeOutDuration);
+      let srcs = [...this._activeSources];
+      setTimeout(() => {
+        this._doPauseSources(srcs);
+        this._applyVolume();
+      }, this._fadeOutDuration * 1000 + 50);
+      return;
+    }
+    this._doPauseCurrent();
+  }
+
+  _doPauseSources(srcs) {
+    if (this._activeSources.length > 0) {
+      this._pausedAt = this._ctx.currentTime - (srcs[0].__startTime || 0);
+    }
+    srcs.forEach(s => {
+      try { s.onended = null; s.stop(); s.disconnect(); } catch (e) {}
+    });
+    this._activeSources = this._activeSources.filter(s => !srcs.includes(s));
+  }
+
+  _doPauseCurrent() {
     if (this._activeSources.length > 0) {
       this._pausedAt = this._ctx.currentTime - (this._activeSources[0].__startTime || 0);
     }
@@ -980,7 +1165,7 @@ class Awdio {
     // ADSR 释放阶段
     if (this._envelopeNode && this._envelope && this._activeSources.length > 0 && !this._releasing) {
       this._releasing = true;
-      const now = this._ctx.currentTime;
+      let now = this._ctx.currentTime;
       this._envelopeNode.gain.cancelScheduledValues(now);
       this._envelopeNode.gain.setValueAtTime(this._envelopeNode.gain.value, now);
       this._envelopeNode.gain.linearRampToValueAtTime(0, now + this._envelope.release);
@@ -1012,7 +1197,7 @@ class Awdio {
     }
 
     if (this._delayMs > 0) {
-      const delay = this._delayMs;
+      let delay = this._delayMs;
       this._delayMs = 0;
       setTimeout(() => this._play(), delay);
       return this;
@@ -1048,9 +1233,9 @@ class Awdio {
   }
 
   seek(time) {
-    const seconds = Awdio._parseTime(time);
+    let seconds = Awdio._parseTime(time);
     if (this._activeSources.length > 0) {
-      const wasLooping = this._loop;
+      let wasLooping = this._loop;
       this._loop = false;
       this._stopAllSources();
       this._pausedAt = seconds;
@@ -1090,9 +1275,9 @@ class Awdio {
 
     if (arg && typeof arg === 'object') {
       // 优先级：src > formula > type（同时存在时按此优先级选取）
-      const hasSrc = arg.src !== undefined;
-      const hasFormula = arg.formula !== undefined;
-      const hasType = arg.type !== undefined;
+      let hasSrc = arg.src !== undefined;
+      let hasFormula = arg.formula !== undefined;
+      let hasType = arg.type !== undefined;
 
       if (hasSrc) {
         // src 最高优先级：清除 formula 和 type
@@ -1144,6 +1329,11 @@ class Awdio {
       }
       if (arg.fadeInDuration !== undefined) this._fadeInDuration = arg.fadeInDuration;
       if (arg.fadeOutDuration !== undefined) this._fadeOutDuration = arg.fadeOutDuration;
+      if (arg.speed !== undefined) this.speed(arg.speed);
+      if (arg.pitch !== undefined) this.pitch(arg.pitch);
+      if (arg.reverse !== undefined) this.reverse(arg.reverse);
+      if (arg.a !== undefined) this._a = Math.max(0, arg.a);
+      if (arg.r !== undefined) this._r = Math.max(0, arg.r);
       if (arg.device !== undefined) {
         this._device = arg.device;
         this._applyDeviceRouting();
@@ -1210,6 +1400,55 @@ class Awdio {
     this._gainNode.gain.value = this._muted ? 0 : this._volume / 100;
   }
 
+  // ==================== 增益运算 ====================
+
+  /**
+   * 设置/获取增益值（线性 0-1，控制 _gainNode 的增益）
+   * @param {number} [val] - 增益值 0-1，不传获取当前值
+   */
+  gain(val) {
+    if (val === undefined) return this._gainNode.gain.value;
+    this._gainNode.gain.value = Math.max(0, Math.min(1, val));
+    return this;
+  }
+
+  /**
+   * 增益乘以系数
+   * @param {number} val - 系数
+   */
+  mul(val) {
+    this._gainNode.gain.value = Math.max(0, Math.min(1, this._gainNode.gain.value * val));
+    return this;
+  }
+
+  /**
+   * 增益除以系数
+   * @param {number} val - 系数
+   */
+  div(val) {
+    if (val === 0) return this;
+    this._gainNode.gain.value = Math.max(0, Math.min(1, this._gainNode.gain.value / val));
+    return this;
+  }
+
+  /**
+   * 增益加上偏移量
+   * @param {number} val - 偏移量
+   */
+  add(val) {
+    this._gainNode.gain.value = Math.max(0, Math.min(1, this._gainNode.gain.value + val));
+    return this;
+  }
+
+  /**
+   * 增益减去偏移量
+   * @param {number} val - 偏移量
+   */
+  sub(val) {
+    this._gainNode.gain.value = Math.max(0, Math.min(1, this._gainNode.gain.value - val));
+    return this;
+  }
+
   // ==================== 命名系统 ====================
 
   setName(name) {
@@ -1247,6 +1486,14 @@ class Awdio {
       fadeOutDuration: this._fadeOutDuration,
       delayMs: this._delayMs,
       device: this._device,
+      _isPlaying: this.playing,
+      _speed: this._speed,
+      speed: this._speed,
+      pitch: this._pitch,
+      reverse: this._reverse,
+      a: this._a,
+      r: this._r,
+      params: { ...this._params },
       destroyed: this._destroyed
     };
   }
@@ -1306,11 +1553,51 @@ class Awdio {
     return this;
   }
 
+  // ==================== 倍速 / 音高 / 倒放 ====================
+
+  /**
+   * 设置/获取播放倍速
+   * @param {number} [rate] - 倍速 0.1~10，不传获取当前值
+   */
+  speed(rate) {
+    if (rate === undefined) return this._speed;
+    this._speed = Math.max(0.1, Math.min(10, rate));
+    // 更新所有活跃 source 的 playbackRate
+    this._activeSources.forEach(s => {
+      try { s.playbackRate.value = this._speed * this._pitch; } catch (e) {}
+    });
+    return this;
+  }
+
+  /**
+   * 设置/获取音高（通过 playbackRate 实现）
+   * @param {number} [rate] - 音高比率 0.1~10，1=原声，2=高八度，0.5=低八度
+   */
+  pitch(rate) {
+    if (rate === undefined) return this._pitch;
+    this._pitch = Math.max(0.1, Math.min(10, rate));
+    this._activeSources.forEach(s => {
+      try { s.playbackRate.value = this._speed * this._pitch; } catch (e) {}
+    });
+    return this;
+  }
+
+  /**
+   * 设置/获取倒放
+   * @param {boolean} [rev] - 是否倒放，不传获取当前值
+   */
+  reverse(rev) {
+    if (rev === undefined) return this._reverse;
+    this._reverse = !!rev;
+    this._reversedBuffer = null;
+    return this;
+  }
+
   // ==================== 淡入淡出 ====================
 
   fadeOut(duration) {
-    const dur = duration || this._fadeOutDuration || 1;
-    const now = this._ctx.currentTime;
+    let dur = duration || this._fadeOutDuration || 1;
+    let now = this._ctx.currentTime;
     this._gainNode.gain.cancelScheduledValues(now);
     this._gainNode.gain.setValueAtTime(this._gainNode.gain.value, now);
     this._gainNode.gain.linearRampToValueAtTime(0, now + dur);
@@ -1409,9 +1696,9 @@ class Awdio {
 
     if (typeof opts === 'number') opts = { mix: opts };
 
-    const room = opts.room != null ? Math.max(0, Math.min(1, opts.room)) : 0.5;
-    const damp = opts.damp != null ? Math.max(0, Math.min(1, opts.damp)) : 0.5;
-    const mix  = opts.mix  != null ? Math.max(0, Math.min(1, opts.mix))  : 0.5;
+    let room = opts.room != null ? Math.max(0, Math.min(1, opts.room)) : 0.5;
+    let damp = opts.damp != null ? Math.max(0, Math.min(1, opts.damp)) : 0.5;
+    let mix  = opts.mix  != null ? Math.max(0, Math.min(1, opts.mix))  : 0.5;
 
     if (!this._reverbNode) {
       this._reverbNode = this._ctx.createConvolver();
@@ -1431,16 +1718,16 @@ class Awdio {
   }
 
   _createReverbIR(room, damp) {
-    const sr = this._ctx.sampleRate;
-    const duration = room * 3 + 0.1;
-    const len = Math.floor(sr * duration);
-    const buffer = this._ctx.createBuffer(2, len, sr);
-    const decayRate = 1 / (room * 2 + 0.2);
+    let sr = this._ctx.sampleRate;
+    let duration = room * 3 + 0.1;
+    let len = Math.floor(sr * duration);
+    let buffer = this._ctx.createBuffer(2, len, sr);
+    let decayRate = 1 / (room * 2 + 0.2);
 
     for (let ch = 0; ch < 2; ch++) {
-      const data = buffer.getChannelData(ch);
+      let data = buffer.getChannelData(ch);
       for (let i = 0; i < len; i++) {
-        const t = i / sr;
+        let t = i / sr;
         data[i] = (Math.random() * 2 - 1) * Math.exp(-t * decayRate * (1 - damp * 0.95));
       }
     }
@@ -1461,10 +1748,10 @@ class Awdio {
 
     if (typeof opts === 'number') opts = { gain: opts };
 
-    const thresh = opts.thresh != null ? opts.thresh : -24;
-    const knee   = opts.knee   != null ? opts.knee   : 30;
-    const ratio  = opts.ratio  != null ? opts.ratio  : 12;
-    const gain   = opts.gain   != null ? Math.max(0, Math.min(1, opts.gain)) : 0.5;
+    let thresh = opts.thresh != null ? opts.thresh : -24;
+    let knee   = opts.knee   != null ? opts.knee   : 30;
+    let ratio  = opts.ratio  != null ? opts.ratio  : 12;
+    let gain   = opts.gain   != null ? Math.max(0, Math.min(1, opts.gain)) : 0.5;
 
     if (!this._compNode) {
       this._compNode = this._ctx.createDynamicsCompressor();
@@ -1517,6 +1804,22 @@ class Awdio {
     return this;
   }
 
+  /**
+   * 高通滤波器便捷方法
+   * @param {number} [freq] - 截止频率 Hz / falsy 关闭
+   * @param {number} [q] - 共鸣度 Q 值
+   */
+  hpf(freq, q) {
+    if (freq === undefined || freq === false || freq === null) {
+      return this.filter();
+    }
+    if (typeof freq === 'object') {
+      freq.type = 'highpass';
+      return this.filter(freq);
+    }
+    return this.filter({ freq, q, type: 'highpass' });
+  }
+
   chorus(opts) {
     if (opts === undefined || opts === false || opts === null) {
       if (this._chorusNode) {
@@ -1531,8 +1834,8 @@ class Awdio {
 
     if (typeof opts === 'number') opts = { perc: opts };
 
-    const perc = opts.perc != null ? Math.max(0, Math.min(1, opts.perc)) : 0.3;
-    const lag  = opts.lag  != null ? Math.max(0.001, Math.min(0.1, opts.lag)) : 0.02;
+    let perc = opts.perc != null ? Math.max(0, Math.min(1, opts.perc)) : 0.3;
+    let lag  = opts.lag  != null ? Math.max(0.001, Math.min(0.1, opts.lag)) : 0.02;
 
     if (!this._chorusNode) {
       this._chorusDelay = this._ctx.createDelay(0.1);
@@ -1543,7 +1846,7 @@ class Awdio {
       this._chorusLFO.frequency.value = 0.5;
       this._chorusLFO.start();
 
-      const lfoGain = this._ctx.createGain();
+      let lfoGain = this._ctx.createGain();
       lfoGain.gain.value = perc * lag * 0.5;
       this._chorusLFO.connect(lfoGain);
       lfoGain.connect(this._chorusDelay.delayTime);
@@ -1565,6 +1868,262 @@ class Awdio {
     }
 
     return this;
+  }
+
+  // ==================== 波形塑形（失真）====================
+
+  /**
+   * 波形塑形/失真效果
+   * @param {object|number} [opts] - 配置对象 / amount值(0-1) / falsy 表示关闭
+   *   opts.amount: 失真量 0-1（默认 0.5）
+   *   opts.curve:  'soft' | 'hard' | 'fuzz' | 'crunch' | 'fold'（默认 'soft'）
+   *
+   * 示例：.waveshaper({ amount: 0.7, curve: 'hard' })
+   *       .waveshaper(0.5)  // 仅设置 amount，默认 soft
+   *       .waveshaper()     // 关闭失真
+   */
+  waveshaper(opts) {
+    if (opts === undefined || opts === false || opts === null) {
+      if (this._waveshaperNode) {
+        this._waveshaperNode.disconnect();
+        this._waveshaperNode = null;
+        this._rebuildChain();
+      }
+      return this;
+    }
+
+    if (typeof opts === 'number') opts = { amount: opts };
+
+    let amount = opts.amount != null ? Math.max(0, Math.min(1, opts.amount)) : 0.5;
+    let curve = opts.curve || 'soft';
+
+    if (!this._waveshaperNode) {
+      this._waveshaperNode = this._ctx.createWaveShaper();
+      this._rebuildChain();
+    }
+
+    this._waveshaperNode.curve = this._createDistortionCurve(amount, curve);
+    this._waveshaperNode.oversample = '2x';
+
+    return this;
+  }
+
+  /**
+   * 创建失真曲线
+   * @param {number} amount - 失真量 0-1
+   * @param {string} type - 曲线类型
+   * @returns {Float32Array}
+   */
+  _createDistortionCurve(amount, type) {
+    let n = 44100;
+    let curve = new Float32Array(n);
+    let k = amount * 10;
+
+    for (let i = 0; i < n; i++) {
+      let x = (i * 2) / n - 1; // -1 to 1
+
+      switch (type) {
+        case 'hard':
+          // 硬削波：超过阈值的直接截断
+          curve[i] = Math.max(-1 + amount, Math.min(1 - amount, x * (1 + k)));
+          break;
+        case 'fuzz':
+          // 法兹：强烈的非对称失真
+          curve[i] = Math.tanh(Math.sin(x * Math.PI * 0.5) * (1 + k * 5)) * (1 - amount * 0.3);
+          break;
+        case 'crunch':
+          // 过载：温和的管状失真
+          curve[i] = Math.sign(x) * (1 - Math.exp(-Math.abs(x) * (1 + k * 3)));
+          break;
+        case 'fold':
+          // 波形折叠：超过阈值后反射回来
+          curve[i] = Math.abs(x) > 1 - amount * 0.8
+            ? Math.sign(x) * (2 * (1 - amount * 0.8) - Math.abs(x))
+            : x;
+          break;
+        case 'soft':
+        default:
+          // 软削波：tanh 曲线
+          curve[i] = Math.tanh(x * (1 + k));
+          break;
+      }
+    }
+
+    return curve;
+  }
+
+  // ==================== 移相效果 ====================
+
+  /**
+   * 移相效果（Phaser）
+   * @param {object|number} [opts] - 配置对象 / rate值(Hz) / falsy 表示关闭
+   *   opts.rate:   调制速率 Hz（默认 1）
+   *   opts.depth:  调制深度 0-1（默认 0.5）
+   *   opts.freq:   中心频率 Hz（默认 1000）
+   *   opts.fb:     反馈量 0-1（默认 0.4）
+   *   opts.stages: 移相阶数 2-12（默认 4）
+   *
+   * 示例：.phaser({ rate: 0.5, depth: 0.7, freq: 800, fb: 0.5 })
+   *       .phaser(1)     // 仅设置 rate
+   *       .phaser()      // 关闭移相
+   */
+  phaser(opts) {
+    if (opts === undefined || opts === false || opts === null) {
+      if (this._phaserNode) {
+        if (this._phaserLFOs) {
+          this._phaserLFOs.forEach(l => { try { l.stop(); l.disconnect(); } catch (e) {} });
+          this._phaserLFOs = null;
+        }
+        this._phaserNode.disconnect();
+        this._phaserNode = null;
+        this._phaserDry.disconnect();
+        this._phaserDry = null;
+        this._phaserWet.disconnect();
+        this._phaserWet = null;
+        this._rebuildChain();
+      }
+      return this;
+    }
+
+    if (typeof opts === 'number') opts = { rate: opts };
+
+    let rate   = opts.rate   != null ? Math.max(0.1, Math.min(10, opts.rate))   : 1;
+    let depth  = opts.depth  != null ? Math.max(0, Math.min(1, opts.depth))      : 0.5;
+    let freq   = opts.freq   != null ? Math.max(20, Math.min(10000, opts.freq))  : 1000;
+    let fb     = opts.fb     != null ? Math.max(0, Math.min(1, opts.fb))         : 0.4;
+    let stages = opts.stages != null ? Math.max(2, Math.min(12, opts.stages))    : 4;
+
+    if (!this._phaserNode) {
+      this._phaserNode = this._ctx.createGain();
+      this._phaserNode.gain.value = 1;
+      this._phaserDry = this._ctx.createGain();
+      this._phaserDry.gain.value = 0.5;
+      this._phaserWet = this._ctx.createGain();
+      this._phaserWet.gain.value = 0.5;
+      this._rebuildChain();
+    }
+
+    // 清理旧的 LFO 和 allpass 节点
+    if (this._phaserLFOs) {
+      this._phaserLFOs.forEach(l => { try { l.stop(); l.disconnect(); } catch (e) {} });
+    }
+    this._phaserLFOs = [];
+
+    // 重新连接：phaserWet 现在需要重新走 allpass 链
+    // 先断开旧的 allpass 链
+    // 注意：在 _rebuildChain 中，prev 已连接到 _phaserWet
+    // 这里我们需要在 _phaserWet 之前插入 allpass 滤波器链
+    // 简单方案：重建整个 phaser 子链
+
+    // 创建 allpass 滤波器链
+    let allpassFilters = [];
+    let apPrev = this._phaserWet;
+    // 断开 _phaserWet 的旧连接
+    this._phaserWet.disconnect();
+
+    for (let s = 0; s < stages; s++) {
+      let apf = this._ctx.createBiquadFilter();
+      apf.type = 'allpass';
+      apf.frequency.value = freq;
+      apf.Q.value = fb * 5;
+      allpassFilters.push(apf);
+    }
+
+    // 串联 allpass 链
+    for (let s = 0; s < stages; s++) {
+      apPrev.connect(allpassFilters[s]);
+      apPrev = allpassFilters[s];
+    }
+    apPrev.connect(this._phaserNode);
+
+    // 创建 LFO 调制每个 allpass 的频率
+    for (let s = 0; s < stages; s++) {
+      let lfo = this._ctx.createOscillator();
+      lfo.type = 'sine';
+      lfo.frequency.value = rate + s * 0.05; // 每阶微调频率
+      lfo.start();
+
+      let lfoGain = this._ctx.createGain();
+      lfoGain.gain.value = depth * freq * 0.5;
+      lfo.connect(lfoGain);
+      lfoGain.connect(allpassFilters[s].frequency);
+
+      this._phaserLFOs.push(lfo);
+    }
+
+    return this;
+  }
+
+  // ==================== 拨弦方法 ====================
+
+  /**
+   * 拨弦：使用 Karplus-Strong 算法生成拨弦音并播放
+   * @param {number|object} [freq] - 频率 Hz（默认 440）/ 配置对象
+   * @param {object} [opts] - 播放选项
+   *   opts.duration: 衰减时长 秒（默认 1.5）
+   *   opts.decay:    衰减系数 0.9-0.999（默认 0.996）
+   *
+   * 示例：.pluck(440)  .pluck(220, { duration: 2 })  .pluck({ freq: 330, decay: 0.99 })
+   * @returns {this}
+   */
+  pluck(freq, opts) {
+    if (this._destroyed) return this;
+
+    if (freq && typeof freq === 'object') {
+      opts = freq;
+      freq = opts.freq || 440;
+    }
+    if (freq === undefined) freq = 440;
+    opts = opts || {};
+
+    let duration = opts.duration || 1.5;
+    let decay = opts.decay || 0.996;
+    let freqVal = Math.max(20, Math.min(8000, freq));
+
+    let buffer = this._createPluckBuffer(freqVal, duration, decay);
+    this._buffer = buffer;
+
+    // 停止当前播放并播放新音
+    this._stopAllSources();
+    this._play();
+
+    return this;
+  }
+
+  /**
+   * 创建拨弦缓冲区
+   * @param {number} freq - 频率
+   * @param {number} duration - 时长
+   * @param {number} decay - 衰减系数
+   */
+  _createPluckBuffer(freq, duration, decay) {
+    let sr = this._ctx.sampleRate;
+    let len = Math.floor(sr * duration);
+    let buffer = this._ctx.createBuffer(1, len, sr);
+    let data = buffer.getChannelData(0);
+
+    let period = Math.floor(sr / freq);
+    if (period < 2) {
+      for (let i = 0; i < len; i++) {
+        data[i] = Math.sin(2 * Math.PI * freq * i / sr) * Math.exp(-i / sr * 3);
+      }
+      return buffer;
+    }
+
+    let noise = new Float32Array(period);
+    for (let i = 0; i < period; i++) {
+      noise[i] = (Math.random() * 2 - 1) * 0.5;
+    }
+
+    for (let i = 0; i < len; i++) {
+      if (i < period) {
+        data[i] = noise[i];
+      } else {
+        data[i] = (data[i - period] + data[i - period + 1]) * 0.5 * decay;
+      }
+    }
+
+    return buffer;
   }
 
   // ==================== 包络（ADSR）====================
@@ -1591,10 +2150,10 @@ class Awdio {
       return this;
     }
 
-    const attack  = opts.attack  != null ? Math.max(0, opts.attack)  : 0.01;
-    const decay   = opts.decay   != null ? Math.max(0, opts.decay)   : 0.1;
-    const sustain = opts.sustain != null ? Math.max(0, Math.min(1, opts.sustain)) : 0.7;
-    const release = opts.release != null ? Math.max(0, opts.release) : 0.3;
+    let attack  = opts.attack  != null ? Math.max(0, opts.attack)  : 0.01;
+    let decay   = opts.decay   != null ? Math.max(0, opts.decay)   : 0.1;
+    let sustain = opts.sustain != null ? Math.max(0, Math.min(1, opts.sustain)) : 0.7;
+    let release = opts.release != null ? Math.max(0, opts.release) : 0.3;
 
     this._envelope = { attack, decay, sustain, release };
 
@@ -1607,6 +2166,278 @@ class Awdio {
     return this;
   }
 
+  // ==================== 参数 a / r / param ====================
+
+  /**
+   * 设置/获取 attack 起音时间（秒）
+   * @param {number} [val] - 起音时间，不传获取当前值
+   */
+  a(val) {
+    if (val === undefined) return this._a;
+    this._a = Math.max(0, val);
+    return this;
+  }
+
+  /**
+   * 设置/获取 release 释音时间（秒）
+   * @param {number} [val] - 释音时间，不传获取当前值
+   */
+  r(val) {
+    if (val === undefined) return this._r;
+    this._r = Math.max(0, val);
+    return this;
+  }
+
+  /**
+   * 获取参数对应的 AudioParam 对象（用于调度）
+   * 支持：'gain' | 'vol' | 'chainGain' | 'filterFreq' | 'filterQ' | 'pan'
+   * @param {string} name - 参数名
+   * @returns {AudioParam|null}
+   */
+  _getAudioParam(name) {
+    switch (name) {
+      case 'gain':
+      case 'vol':
+        return this._gainNode.gain;
+      case 'chainGain':
+        return this._chainInput.gain;
+      case 'filterFreq':
+        return this._filterNode ? this._filterNode.frequency : null;
+      case 'filterQ':
+        return this._filterNode ? this._filterNode.Q : null;
+      case 'pan': {
+        if (!this._stereoPanner) {
+          this._stereoPanner = this._ctx.createStereoPanner();
+          this._stereoPanner.pan.value = 0;
+          this._rebuildChain();
+        }
+        return this._stereoPanner.pan;
+      }
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * 设置/获取/删除参数（连接真实音频链路）
+   *
+   * 保留参数名（直接路由到 AudioParam）：
+   *   'gain'       → 输出增益 0-1
+   *   'vol'        → 输出增益（百分制 0-100，内部转为 0-1）
+   *   'chainGain'  → 链输入增益 0-1
+   *   'filterFreq' → 滤波器截止频率 Hz
+   *   'filterQ'    → 滤波器 Q 值
+   *   'pan'        → 立体声平衡 -1~1（自动创建 StereoPanner）
+   *   'freq'       → 合成频率 Hz（重新生成 buffer）
+   *   'speed'      → 播放倍速 0.1-10
+   *
+   * 自定义参数名 → 存入 _params 字典（向后兼容）
+   *
+   * @param {string} key - 参数名
+   * @param {*} [val]   - 参数值，不传则获取，传 null 则删除
+   * @returns {this|*}
+   */
+  param(key, val) {
+    if (val === undefined) {
+      // 获取：优先 AudioParam，其次 _params
+      let ap = this._getAudioParam(key);
+      if (ap) return ap.value;
+      // 特殊处理 freq/speed
+      if (key === 'freq') return this._freq;
+      if (key === 'speed') return this._speed;
+      return this._params[key];
+    }
+
+    if (val === null) {
+      // 删除
+      let ap = this._getAudioParam(key);
+      if (ap) {
+        ap.value = ap.defaultValue || 0;
+      }
+      if (key === 'pan' && this._stereoPanner) {
+        this._stereoPanner.disconnect();
+        this._stereoPanner = null;
+        this._rebuildChain();
+      }
+      delete this._params[key];
+      return this;
+    }
+
+    // 设置：路由到真实 AudioParam
+    let ap = this._getAudioParam(key);
+    if (ap) {
+      if (key === 'vol') {
+        ap.value = Math.max(0, Math.min(100, val)) / 100;
+      } else if (key === 'gain') {
+        ap.value = Math.max(0, Math.min(1, val));
+      } else if (key === 'chainGain') {
+        ap.value = Math.max(0, Math.min(1, val));
+      } else if (key === 'filterFreq') {
+        ap.value = Math.max(20, Math.min(20000, val));
+      } else if (key === 'filterQ') {
+        ap.value = Math.max(0.0001, Math.min(1000, val));
+      } else if (key === 'pan') {
+        ap.value = Math.max(-1, Math.min(1, val));
+      }
+      return this;
+    }
+
+    // 特殊处理 freq / speed
+    if (key === 'freq') {
+      this._freq = Math.max(20, Math.min(20000, val));
+      if (!this._src && (this._formula || this._type)) {
+        this._buffer = this._createBuffer(this._formula || this._type, this._freq);
+      }
+      return this;
+    }
+    if (key === 'speed') {
+      this.speed(val);
+      return this;
+    }
+
+    // 自定义参数 → 字典存储
+    this._params[key] = val;
+    return this;
+  }
+
+  // ==================== 参数自动化调度 ====================
+
+  /**
+   * 线性渐变到目标值
+   * @param {string} paramName - 参数名 ('gain'|'vol'|'chainGain'|'filterFreq'|'filterQ'|'pan')
+   * @param {number} target - 目标值
+   * @param {number} duration - 渐变时长（秒）
+   * @param {number} [delay] - 延迟开始时间（秒，默认 0）
+   *
+   * 示例：.ramp('gain', 0, 2)        // 2 秒内增益降到 0
+   *       .ramp('filterFreq', 8000, 1.5)  // 1.5 秒内扫频到 8kHz
+   *       .ramp('pan', 1, 0.5)       // 0.5 秒内声像移到最右
+   *       .ramp('gain', 0.5, 1, 0.5) // 0.5s 后开始，1s 内渐变
+   */
+  ramp(paramName, target, duration, delay) {
+    if (typeof paramName === 'number') {
+      // 快捷写法：.ramp(target, duration) → 默认 ramp gain
+      delay = duration;
+      duration = target;
+      target = paramName;
+      paramName = 'gain';
+    }
+    let ap = this._getAudioParam(paramName);
+    if (!ap) {
+      console.warn('Awdio: ramp() 不支持的参数名:', paramName);
+      return this;
+    }
+    let now = this._ctx.currentTime;
+    let startTime = now + (delay || 0);
+    let endTime = startTime + duration;
+
+    let clamped = target;
+    if (paramName === 'vol') clamped = Math.max(0, Math.min(100, target)) / 100;
+    else if (paramName === 'gain' || paramName === 'chainGain') clamped = Math.max(0, Math.min(1, target));
+    else if (paramName === 'filterFreq') clamped = Math.max(20, Math.min(20000, target));
+    else if (paramName === 'filterQ') clamped = Math.max(0.0001, Math.min(1000, target));
+    else if (paramName === 'pan') clamped = Math.max(-1, Math.min(1, target));
+
+    ap.cancelScheduledValues(now);
+    ap.setValueAtTime(ap.value, now);
+    ap.linearRampToValueAtTime(clamped, endTime);
+
+    return this;
+  }
+
+  /**
+   * 指数渐变到目标值
+   * @param {string} paramName - 参数名
+   * @param {number} target - 目标值
+   * @param {number} duration - 渐变时长（秒）
+   * @param {number} [delay] - 延迟开始时间（秒，默认 0）
+   *
+   * 示例：.expoRamp('gain', 0.01, 3)  // 3 秒内指数衰减
+   */
+  expoRamp(paramName, target, duration, delay) {
+    if (typeof paramName === 'number') {
+      delay = duration;
+      duration = target;
+      target = paramName;
+      paramName = 'gain';
+    }
+    let ap = this._getAudioParam(paramName);
+    if (!ap) {
+      console.warn('Awdio: expoRamp() 不支持的参数名:', paramName);
+      return this;
+    }
+    let now = this._ctx.currentTime;
+    let startTime = now + (delay || 0);
+    let endTime = startTime + duration;
+
+    let clamped = target;
+    if (paramName === 'vol') clamped = Math.max(0, Math.min(100, target)) / 100;
+    else if (paramName === 'gain' || paramName === 'chainGain') clamped = Math.max(0.0001, Math.min(1, target));
+    else if (paramName === 'filterFreq') clamped = Math.max(20, Math.min(20000, target));
+    else if (paramName === 'filterQ') clamped = Math.max(0.0001, Math.min(1000, target));
+    else if (paramName === 'pan') clamped = Math.max(-1, Math.min(1, target));
+
+    ap.cancelScheduledValues(now);
+    ap.setValueAtTime(Math.max(0.0001, ap.value), now);
+    ap.exponentialRampToValueAtTime(Math.max(0.0001, clamped), endTime);
+
+    return this;
+  }
+
+  /**
+   * 在指定时间点设置参数值（不渐变）
+   * @param {string} paramName - 参数名
+   * @param {number} value - 目标值
+   * @param {number} time - 目标时间（秒，相对于 now；默认 0 = 立即）
+   *
+   * 示例：.setAtTime('gain', 0, 2)  // 2 秒后增益归零
+   */
+  setAtTime(paramName, value, time) {
+    if (typeof paramName === 'number') {
+      time = value;
+      value = paramName;
+      paramName = 'gain';
+    }
+    let ap = this._getAudioParam(paramName);
+    if (!ap) {
+      console.warn('Awdio: setAtTime() 不支持的参数名:', paramName);
+      return this;
+    }
+    let now = this._ctx.currentTime;
+    let t = now + (time || 0);
+
+    let clamped = value;
+    if (paramName === 'vol') clamped = Math.max(0, Math.min(100, value)) / 100;
+    else if (paramName === 'gain' || paramName === 'chainGain') clamped = Math.max(0, Math.min(1, value));
+    else if (paramName === 'filterFreq') clamped = Math.max(20, Math.min(20000, value));
+    else if (paramName === 'filterQ') clamped = Math.max(0.0001, Math.min(1000, value));
+    else if (paramName === 'pan') clamped = Math.max(-1, Math.min(1, value));
+
+    ap.setValueAtTime(clamped, t);
+
+    return this;
+  }
+
+  /**
+   * 取消所有已调度但未执行的参数变化，立即保持当前值
+   * @param {string} [paramName] - 参数名，不传则取消所有已知参数
+   *
+   * 示例：.cancelSched('gain')  // 取消 gain 的调度
+   *       .cancelSched()        // 取消所有参数调度
+   */
+  cancelSched(paramName) {
+    let now = this._ctx.currentTime;
+    let names = paramName ? [paramName] : ['gain', 'vol', 'chainGain', 'filterFreq', 'filterQ', 'pan'];
+    names.forEach(name => {
+      let ap = this._getAudioParam(name);
+      if (ap) {
+        ap.cancelScheduledValues(now);
+        ap.setValueAtTime(ap.value, now);
+      }
+    });
+    return this;
+  }
+
   // ==================== clone 方法 ====================
 
   /**
@@ -1614,7 +2445,7 @@ class Awdio {
    * 支持 .clone()  /  .clone({ volume: 50 })  /  .clone("sine")  /  .clone("https://...")  /  .clone(fn)
    */
   clone(arg) {
-    const currentOpts = this.getOption();
+    let currentOpts = this.getOption();
 
     if (arg === undefined) {
       // 无参：纯克隆
@@ -1647,7 +2478,7 @@ class Awdio {
     currentOpts.destroyed = false;
     currentOpts.delayMs = 0;
 
-    const newInstance = new Awdio(currentOpts);
+    let newInstance = new Awdio(currentOpts);
     this._emit('clone', { instance: newInstance, opts: arg });
     return newInstance;
   }
@@ -1661,8 +2492,12 @@ class Awdio {
     this._stopAllSources();
     if (this._releaseTimeoutId) clearTimeout(this._releaseTimeoutId);
     if (this._chorusLFO) { try { this._chorusLFO.stop(); this._chorusLFO.disconnect(); } catch (e) {} }
+    if (this._phaserLFOs) {
+      this._phaserLFOs.forEach(l => { try { l.stop(); l.disconnect(); } catch (e) {} });
+    }
     this._chainInput.disconnect();
     if (this._envelopeNode) this._envelopeNode.disconnect();
+    if (this._waveshaperNode) this._waveshaperNode.disconnect();
     if (this._filterNode) this._filterNode.disconnect();
     if (this._compNode) this._compNode.disconnect();
     if (this._compGainNode) this._compGainNode.disconnect();
@@ -1673,6 +2508,10 @@ class Awdio {
     if (this._chorusWet) this._chorusWet.disconnect();
     if (this._chorusDelay) this._chorusDelay.disconnect();
     if (this._chorusNode) this._chorusNode.disconnect();
+    if (this._phaserDry) this._phaserDry.disconnect();
+    if (this._phaserWet) this._phaserWet.disconnect();
+    if (this._phaserNode) this._phaserNode.disconnect();
+    if (this._stereoPanner) this._stereoPanner.disconnect();
     if (this._pannerNode) this._pannerNode.disconnect();
     this._gainNode.disconnect();
     this._unbindVisibility();
@@ -1706,6 +2545,7 @@ class _AwdioManager {
     this._timeoutId = null;
     this._currentPlaying = null;
     this._events = {};
+    this._perItemDelays = []; // 逐项延迟（毫秒），与 _items 一一对应
 
     // autoplay
     if (this._autoplay && this._items.length > 0) {
@@ -1733,7 +2573,7 @@ class _AwdioManager {
     if (indices.length > 0) {
       indices.forEach(i => {
         if (i >= 0 && i < this._items.length) {
-          const item = this._items[i];
+          let item = this._items[i];
           if (this._fadeIn || item._fadeIn) {
             item._fadeIn = true;
             item._fadeInDuration = this._fadeInDuration || item._fadeInDuration;
@@ -1803,10 +2643,10 @@ class _AwdioManager {
       return;
     }
 
-    const item = this._items[this._currentIndex];
+    let item = this._items[this._currentIndex];
     this._currentPlaying = item;
 
-    const origLoop = item._loop;
+    let origLoop = item._loop;
     item._loop = false;
 
     if (this._fadeIn || item._fadeIn) {
@@ -1818,15 +2658,17 @@ class _AwdioManager {
       item._fadeOutDuration = this._fadeOutDuration || item._fadeOutDuration;
     }
 
-    const onEnd = () => {
+    let onEnd = () => {
       item.off('end', onEnd);
       item._loop = origLoop;
       this._currentPlaying = null;
+      let idx = this._currentIndex;
       this._currentIndex++;
-      if (this._delay > 0) {
+      let perDelay = (this._perItemDelays && this._perItemDelays[idx] > 0) ? this._perItemDelays[idx] : this._delay;
+      if (perDelay > 0) {
         this._timeoutId = setTimeout(() => {
           this._playSequential(this._currentIndex);
-        }, this._delay);
+        }, perDelay);
       } else {
         this._playSequential(this._currentIndex);
       }
@@ -1855,7 +2697,7 @@ class _AwdioManager {
       this._emit('play', { index, instance: item });
 
       if (this._loop) {
-        const onEnd = () => {
+        let onEnd = () => {
           item.off('end', onEnd);
           item.play();
         };
@@ -1875,7 +2717,7 @@ class _AwdioManager {
   }
 
   add(item, position) {
-    const instance = Awdio._resolve(item);
+    let instance = Awdio._resolve(item);
     if (!instance) return this;
 
     if (position === undefined || position >= this._items.length) {
@@ -1888,9 +2730,19 @@ class _AwdioManager {
 
   toggle(a, b) {
     if (a < 0 || a >= this._items.length || b < 0 || b >= this._items.length) return this;
-    const temp = this._items[a];
+    let temp = this._items[a];
     this._items[a] = this._items[b];
     this._items[b] = temp;
+    return this;
+  }
+
+  /**
+   * 设置/获取队列逐项延迟（毫秒）
+   * @param {number} [ms] - 延迟毫秒数，不传获取当前值
+   */
+  delay(ms) {
+    if (ms === undefined) return this._delay;
+    this._delay = ms;
     return this;
   }
 

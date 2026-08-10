@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
  * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
- * @version 3.6.0
+ * @version 3.9.0
  */
 
 declare class Awdio {
@@ -61,6 +61,14 @@ declare class Awdio {
   static defineFormula(name: string, fn: (t: number, freq: number, sr: number, opts: Readonly<AwdioOptions>) => number): void;
 
   /**
+   * MIDI 音符转频率
+   * @param note - MIDI 音符编号（69=A4=440Hz）
+   * @returns 频率 (Hz)
+   * 示例：Awdio.midicps(69) → 440，Awdio.midicps(60) → 261.63 (C4)
+   */
+  static midicps(note: number): number;
+
+  /**
    * 设置 3D 空间音频监听者位置/朝向
    * @param opts
    *   opts.x, opts.y, opts.z          - 监听者 3D 坐标
@@ -96,8 +104,9 @@ declare class Awdio {
   /**
    * 队列播放（顺序播放，一个播完再播下一个）
    *
-   * 支持数组写法：Awdio.queue([a, b, c], { loop, delay, fade, autoplay })
-   * 支持快速写法：Awdio.queue(a, b, c)
+   * 支持数组写法：Awdio.queue([a, 200, b, c], { loop, delay, fade, autoplay })
+   *   数字跟在 item 后表示逐项延迟（叠加全局 delay）
+   * 支持扁平写法：Awdio.queue(100, a, 200, b, 300)  // 数字=延迟
    * 支持公式：Awdio.queue(myFormulaFn, "sine", { freq: 880 })
    */
   static queue(...args: any[]): AwdioManager;
@@ -105,8 +114,8 @@ declare class Awdio {
   /**
    * 同时播放（所有音频同时播放）
    *
-   * 支持数组写法：Awdio.playAll([a, b, c], { loop, fade, autoplay })
-   * 支持快速写法：Awdio.playAll(a, b, c)
+   * 支持数组写法：Awdio.playAll([a, 200, b, c], { loop, fade, autoplay })
+   * 支持扁平写法：Awdio.playAll(100, a, 200, b)
    * 支持公式：Awdio.playAll(myFormulaFn, "kick", inst)
    */
   static playAll(...args: any[]): AwdioManager;
@@ -189,6 +198,21 @@ declare class Awdio {
   /** 静音切换 */
   mute(muted?: boolean): this;
 
+  // ==================== 增益运算 ====================
+
+  /** 设置/获取增益值（线性 0-1） */
+  gain(): number;
+  gain(val: number): this;
+
+  /** 增益乘以系数 */
+  mul(val: number): this;
+  /** 增益除以系数 */
+  div(val: number): this;
+  /** 增益加上偏移量 */
+  add(val: number): this;
+  /** 增益减去偏移量 */
+  sub(val: number): this;
+
   /** 设置实例名称 */
   setName(name: string): this;
 
@@ -216,6 +240,29 @@ declare class Awdio {
 
   /** 设置播放延迟（毫秒） */
   delay(ms: number): this;
+
+  // ==================== 倍速 / 音高 / 倒放 ====================
+
+  /**
+   * 设置/获取播放倍速
+   * @param rate - 倍速 0.1~10，不传获取当前值
+   */
+  speed(): number;
+  speed(rate: number): this;
+
+  /**
+   * 设置/获取音高（通过 playbackRate 实现）
+   * @param rate - 音高比率 0.1~10，1=原声，2=高八度，0.5=低八度
+   */
+  pitch(): number;
+  pitch(rate: number): this;
+
+  /**
+   * 设置/获取倒放
+   * @param rev - 是否倒放，不传获取当前值
+   */
+  reverse(): boolean;
+  reverse(rev: boolean): this;
 
   // ==================== 淡入淡出 ====================
 
@@ -277,6 +324,13 @@ declare class Awdio {
   filter(freq?: number | FilterOptions | false | null, q?: number): this;
 
   /**
+   * 高通滤波器便捷方法
+   * @param freq - 截止频率 Hz / falsy 关闭
+   * @param q   - 共鸣度 Q 值
+   */
+  hpf(freq?: number | FilterOptions | false | null, q?: number): this;
+
+  /**
    * 合唱效果
    * @param opts - 配置对象 / falsy 表示关闭
    *   opts.perc: 调制深度 0-1（默认 0.3）
@@ -286,6 +340,44 @@ declare class Awdio {
    *       .chorus()  // 关闭合唱
    */
   chorus(opts?: ChorusOptions | number | false | null): this;
+
+  /**
+   * 波形塑形/失真效果
+   * @param opts - 配置对象 / amount值(0-1) / falsy 表示关闭
+   *   opts.amount: 失真量 0-1（默认 0.5）
+   *   opts.curve:  'soft' | 'hard' | 'fuzz' | 'crunch' | 'fold'（默认 'soft'）
+   *
+   * 示例：.waveshaper({ amount: 0.7, curve: 'hard' })
+   *       .waveshaper(0.5)  // 仅设置 amount，默认 soft
+   *       .waveshaper()     // 关闭失真
+   */
+  waveshaper(opts?: WaveshaperOptions | number | false | null): this;
+
+  /**
+   * 移相效果（Phaser）
+   * @param opts - 配置对象 / rate值(Hz) / falsy 表示关闭
+   *   opts.rate:   调制速率 Hz（默认 1）
+   *   opts.depth:  调制深度 0-1（默认 0.5）
+   *   opts.freq:   中心频率 Hz（默认 1000）
+   *   opts.fb:     反馈量 0-1（默认 0.4）
+   *   opts.stages: 移相阶数 2-12（默认 4）
+   *
+   * 示例：.phaser({ rate: 0.5, depth: 0.7, freq: 800, fb: 0.5 })
+   *       .phaser(1)     // 仅设置 rate
+   *       .phaser()      // 关闭移相
+   */
+  phaser(opts?: PhaserOptions | number | false | null): this;
+
+  /**
+   * 拨弦：使用 Karplus-Strong 算法生成拨弦音并播放
+   * @param freq - 频率 Hz（默认 440）/ 配置对象
+   * @param opts - 播放选项
+   *   opts.duration: 衰减时长 秒（默认 1.5）
+   *   opts.decay:    衰减系数 0.9-0.999（默认 0.996）
+   *
+   * 示例：.pluck(440)  .pluck(220, { duration: 2 })  .pluck({ freq: 330, decay: 0.99 })
+   */
+  pluck(freq?: number | PluckOptions, opts?: PluckOptions): this;
 
   /**
    * 设置 ADSR 包络
@@ -299,6 +391,84 @@ declare class Awdio {
    *       .envelope()  // 关闭包络
  */
   envelope(opts?: EnvelopeOptions | false | null): this;
+
+  // ==================== 参数 a / r / param ====================
+
+  /**
+   * 设置/获取 attack 起音时间（秒）
+   * @param val - 起音时间，不传获取当前值
+   */
+  a(): number;
+  a(val: number): this;
+
+  /**
+   * 设置/获取 release 释音时间（秒）
+   * @param val - 释音时间，不传获取当前值
+   */
+  r(): number;
+  r(val: number): this;
+
+  /**
+   * 设置/获取/删除参数（连接真实音频链路）
+   *
+   * 保留参数名（直接路由到 AudioParam）：
+   *   'gain'       → 输出增益 0-1
+   *   'vol'        → 输出增益（百分制 0-100）
+   *   'chainGain'  → 链输入增益 0-1
+   *   'filterFreq' → 滤波器截止频率 Hz
+   *   'filterQ'    → 滤波器 Q 值
+   *   'pan'        → 立体声平衡 -1~1（自动创建 StereoPanner）
+   *   'freq'       → 合成频率 Hz
+   *   'speed'      → 播放倍速 0.1-10
+   *
+   * 自定义参数名 → 存入 _params 字典
+   */
+  param(key: string): any;
+  param(key: string, val: any): this;
+
+  // ==================== 参数自动化调度 ====================
+
+  /**
+   * 线性渐变到目标值
+   * @param paramName - 参数名 ('gain'|'vol'|'chainGain'|'filterFreq'|'filterQ'|'pan')
+   * @param target - 目标值
+   * @param duration - 渐变时长（秒）
+   * @param delay - 延迟开始时间（秒，默认 0）
+   *
+   * 快捷写法：.ramp(target, duration) → 默认 ramp gain
+   *
+   * 示例：.ramp('gain', 0, 2)           // 2s 内增益降到 0
+   *       .ramp('filterFreq', 8000, 1.5) // 1.5s 内扫频到 8kHz
+   *       .ramp(0.5, 1)                  // 1s 内 gain 渐变到 0.5
+   */
+  ramp(paramName: string | number, target: number, duration: number, delay?: number): this;
+
+  /**
+   * 指数渐变到目标值
+   * @param paramName - 参数名
+   * @param target - 目标值
+   * @param duration - 渐变时长（秒）
+   * @param delay - 延迟开始时间（秒，默认 0）
+   *
+   * 快捷写法：.expoRamp(target, duration) → 默认 ramp gain
+   */
+  expoRamp(paramName: string | number, target: number, duration: number, delay?: number): this;
+
+  /**
+   * 在指定时间点设置参数值（不渐变）
+   * @param paramName - 参数名
+   * @param value - 目标值
+   * @param time - 目标时间（秒，相对于 now；默认 0 = 立即）
+   *
+   * 快捷写法：.setAtTime(value, time) → 默认 set gain
+   */
+  setAtTime(paramName: string | number, value: number, time?: number): this;
+
+  /**
+   * 取消所有已调度但未执行的参数变化
+   * @param paramName - 参数名，不传则取消所有
+   */
+  cancelSched(paramName?: string): this;
 
   // ==================== 实例设备路由 ====================
 
@@ -331,7 +501,7 @@ declare class Awdio {
 /** Awdio 波形类型 */
 type AwdioWaveType =
   // 基础波形
-  | 'sine' | 'square' | 'sawtooth' | 'triangle' | 'noise'
+  | 'sine' | 'square' | 'sawtooth' | 'triangle' | 'noise' | 'pink'
   | 'cosine' | 'tan' | 'pulse'
   // 乐器模拟
   | 'organ' | 'bell' | 'guitar' | 'piano' | 'strings' | 'brass' | 'flute'
@@ -339,7 +509,7 @@ type AwdioWaveType =
   // 管乐器
   | 'clarinet' | 'oboe' | 'bassoon' | 'trumpet' | 'trombone' | 'tuba'
   // 打击乐
-  | 'kick' | 'snare' | 'hihat' | 'pluck'
+  | 'kick' | 'snare' | 'hihat' | 'pluck' | 'perc'
   | 'tom' | 'clap' | 'crash' | 'ride' | 'cowbell' | 'rimshot'
   // FM 合成
   | 'epiano' | 'fm_bell' | 'fm_bass' | 'fm_lead'
@@ -400,6 +570,38 @@ interface FilterOptions {
   type?: 'lowpass' | 'highpass' | 'bandpass' | 'lowshelf' | 'highshelf' | 'peaking' | 'notch' | 'allpass';
 }
 
+/** 波形塑形/失真选项 */
+interface WaveshaperOptions {
+  /** 失真量 0-1（默认 0.5） */
+  amount?: number;
+  /** 曲线类型（默认 'soft'） */
+  curve?: 'soft' | 'hard' | 'fuzz' | 'crunch' | 'fold';
+}
+
+/** 移相效果选项 */
+interface PhaserOptions {
+  /** 调制速率 Hz（默认 1） */
+  rate?: number;
+  /** 调制深度 0-1（默认 0.5） */
+  depth?: number;
+  /** 中心频率 Hz（默认 1000） */
+  freq?: number;
+  /** 反馈量 0-1（默认 0.4） */
+  fb?: number;
+  /** 移相阶数 2-12（默认 4） */
+  stages?: number;
+}
+
+/** 拨弦选项 */
+interface PluckOptions {
+  /** 频率 Hz（默认 440） */
+  freq?: number;
+  /** 衰减时长 秒（默认 1.5） */
+  duration?: number;
+  /** 衰减系数 0.9-0.999（默认 0.996） */
+  decay?: number;
+}
+
 /** Awdio 实例选项 */
 interface AwdioOptions {
   /** 音频文件 URL（支持 http/https URL、本地路径、data URI）。优先级最高 */
@@ -441,8 +643,24 @@ interface AwdioOptions {
   fadeInDuration?: number;
   /** 淡出时长（秒） */
   fadeOutDuration?: number;
+  /** 播放倍速 0.1~10（默认 1） */
+  speed?: number;
+  /** 音高比率 0.1~10（默认 1），1=原声，2=高八度 */
+  pitch?: number;
+  /** 是否倒放（默认 false） */
+  reverse?: boolean;
+  /** Attack 起音时间 秒（默认 0.01） */
+  a?: number;
+  /** Release 释音时间 秒（默认 0.3） */
+  r?: number;
+  /** 任意命名参数存储 */
+  params?: Record<string, any>;
   /** 延迟播放（毫秒，内部使用） */
   delayMs?: number;
+  /** 是否正在播放（内部使用） */
+  _isPlaying?: boolean;
+  /** 当前倍速（内部使用） */
+  _speed?: number;
   /** 是否已销毁（内部使用） */
   destroyed?: boolean;
 }
@@ -488,6 +706,13 @@ interface AwdioManager {
    * @param b - 第二个位置
    */
   toggle(a: number, b: number): this;
+
+  /**
+   * 设置/获取队列逐项延迟（毫秒）
+   * @param ms - 延迟毫秒数，不传获取当前值
+   */
+  delay(): number;
+  delay(ms: number): this;
 
   /** 获取所有项目 */
   readonly items: ReadonlyArray<Awdio>;
