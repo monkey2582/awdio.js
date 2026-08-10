@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
  * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
- * @version 3.9.0
+ * @version 3.10.0
  */
 (function (root, factory) {
   if (typeof define === 'function' && define.amd) {
@@ -402,8 +402,7 @@ class Awdio {
 
     this._device = null;           // 实例级输出设备（null | string | string[]）
     this._deviceOutputs = null;    // 设备输出节点列表
-
-    this._gainNode.connect(Awdio.getGlobalGainNode());
+    this._chainConnected = false;  // 增益链是否已连接到全局输出（按需连接，闲置断开）
 
     this._chainInput.connect(this._gainNode);
 
@@ -458,9 +457,10 @@ class Awdio {
     this._freq = opts.freq || 440;
     this._duration = opts.duration != null ? opts.duration : 2;
     this._volume = opts.volume != null ? opts.volume : 100;
-    this._loop = opts.loop != null ? opts.loop : (!!this._type);
+    this._loop = opts.loop != null ? opts.loop : false;
     this._poly = opts.poly || false;
     this._autoplay = opts.autoplay || false;
+    this._autoDestroy = opts.autoDestroy || false; // 播放完毕后自动销毁
     this._muted = opts.muted || false;
     this._fade = opts.fade || false;
     this._fadeIn = opts.fade != null ? !!opts.fade : (opts.fadeIn || false);
@@ -626,10 +626,19 @@ class Awdio {
       this._deviceOutputs = null;
     }
 
+    // 断开所有输出连接（全局 + 设备）
     this._gainNode.disconnect();
-    this._gainNode.connect(Awdio.getGlobalGainNode()); // 始终连全局
 
-    if (!this._device) return;
+    // 仅当播放中时才重新连接到全局输出（否则由 _ensureChainConnected 在播放时连接）
+    let wasConnected = this._chainConnected;
+    if (wasConnected) {
+      this._gainNode.connect(Awdio.getGlobalGainNode());
+    }
+
+    if (!this._device) {
+      this._chainConnected = wasConnected;
+      return;
+    }
 
     let ids = Array.isArray(this._device) ? this._device : [this._device];
     this._deviceOutputs = [];
@@ -655,6 +664,27 @@ class Awdio {
       }
 
       this._deviceOutputs.push({ destNode, audioEl });
+    }
+  }
+
+  /**
+   * 确保增益链已连接到全局输出（按需连接，避免闲置节点泄漏）
+   */
+  _ensureChainConnected() {
+    if (!this._chainConnected) {
+      this._gainNode.connect(Awdio.getGlobalGainNode());
+      this._chainConnected = true;
+    }
+  }
+
+  /**
+   * 断开增益链与全局输出的连接（释放 AudioContext 节点资源）
+   * 保留 _gainNode 本身及其内部效果链，仅断开到全局输出的连线
+   */
+  _disconnectFromOutput() {
+    if (this._chainConnected && this._activeSources.length === 0) {
+      this._gainNode.disconnect(Awdio.getGlobalGainNode());
+      this._chainConnected = false;
     }
   }
 
@@ -1072,6 +1102,9 @@ class Awdio {
       this._ctx.resume();
     }
 
+    // 按需连接增益链到全局输出（防止闲置节点泄漏）
+    this._ensureChainConnected();
+
     if (!this._poly) {
       this._stopAllSources();
     }
@@ -1115,8 +1148,17 @@ class Awdio {
       if (idx !== -1) this._activeSources.splice(idx, 1);
       try { source.disconnect(); } catch (e) {}
       if (this._activeSources.length === 0) {
-        this._emit('end');
-      }
+          this._emit('end');
+          // 非循环非多音模式：播放完毕断开全局输出，释放音频图资源
+          if (!this._loop && !this._poly) {
+            this._disconnectFromOutput();
+            // autoDestroy：播放完毕自动销毁实例，彻底释放所有节点
+            if (this._autoDestroy) {
+              this.destroy();
+              return;
+            }
+          }
+        }
     };
 
     if (!this._loop) {
@@ -1229,6 +1271,8 @@ class Awdio {
     this._stopAllSources();
     this._pausedAt = 0;
     this._emit('stop');
+    // 停止后断开全局输出，释放音频图资源
+    this._disconnectFromOutput();
     return this;
   }
 
@@ -1316,6 +1360,7 @@ class Awdio {
       if (arg.loop !== undefined) this._loop = arg.loop;
       if (arg.poly !== undefined) this._poly = arg.poly;
       if (arg.autoplay !== undefined) this._autoplay = arg.autoplay;
+      if (arg.autoDestroy !== undefined) this._autoDestroy = arg.autoDestroy;
       if (arg.muted !== undefined) this._muted = arg.muted;
       if (arg.fade !== undefined) {
         this._fade = !!arg.fade;
@@ -1477,6 +1522,7 @@ class Awdio {
       loop: this._loop,
       poly: this._poly,
       autoplay: this._autoplay,
+      autoDestroy: this._autoDestroy,
       muted: this._muted,
       fade: this._fade,
       fadeIn: this._fadeIn,

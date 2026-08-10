@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
  * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
- * @version 3.9.0
+ * @version 3.10.0
  */
 
 declare class Awdio {
@@ -625,6 +625,8 @@ interface AwdioOptions {
   poly?: boolean;
   /** 是否自动播放 */
   autoplay?: boolean;
+  /** 播放完毕后自动销毁实例（默认 false） */
+  autoDestroy?: boolean;
   /** 是否静音 */
   muted?: boolean;
   /** 实例名称 */
