@@ -3,7 +3,7 @@
  * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
  * @version 3.10.0
  */
-(function (root, factory) {
+!(function(root,factory){
   if (typeof define === 'function' && define.amd) {
     define([], factory);
   } else if (typeof module === 'object' && module.exports) {
@@ -11,7 +11,7 @@
   } else {
     root.Awdio = factory();
   }
-}(typeof self !== 'undefined' ? self : this, function () {
+})(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
 class Awdio {
@@ -24,6 +24,10 @@ class Awdio {
 
   /** 用户自定义公式 */
   static _formulas = new Map();
+
+  /** 设备断开监听：追踪所有设置了实例级设备的 Awdio 实例 */
+  static _deviceChangeInstances = new Set();
+  static _deviceChangeSetup = false;
 
   /** 已知波形类型列表 */
   static _waveTypes = [
@@ -402,6 +406,7 @@ class Awdio {
 
     this._device = null;           // 实例级输出设备（null | string | string[]）
     this._deviceOutputs = null;    // 设备输出节点列表
+    this._deviceChangeHandler = null; // 设备断开自动降级监听
     this._chainConnected = false;  // 增益链是否已连接到全局输出（按需连接，闲置断开）
 
     this._chainInput.connect(this._gainNode);
@@ -424,6 +429,9 @@ class Awdio {
     this._phaserLFOs = null;
     this._stereoPanner = null;
     this._pannerNode = null;
+    this._analyserNode = null;     // FFT 频谱分析
+    this._freqData = null;         // 频域数据缓存
+    this._timeData = null;         // 时域数据缓存
 
     // 解析参数：支持函数作为 formula
     let opts = {};
@@ -498,6 +506,7 @@ class Awdio {
     if (opts.device) {
       this._device = opts.device;
       this._applyDeviceRouting();
+      this._bindDeviceWatch();
     }
 
     // 应用音量
@@ -538,6 +547,7 @@ class Awdio {
     if (this._phaserNode) this._phaserNode.disconnect();
     if (this._stereoPanner) this._stereoPanner.disconnect();
     if (this._pannerNode) this._pannerNode.disconnect();
+    if (this._analyserNode) this._analyserNode.disconnect();
     this._gainNode.disconnect();
 
     let prev = this._chainInput;
@@ -602,6 +612,13 @@ class Awdio {
     if (prev && this._stereoPanner) {
       prev.connect(this._stereoPanner);
       prev = this._stereoPanner;
+    }
+
+    // FFT 频谱分析（位于效果链末端，捕获完整处理后的信号）
+    if (prev && this._analyserNode) {
+      prev.connect(this._analyserNode);
+      this._analyserNode.connect(this._gainNode);
+      prev = null;
     }
 
     if (prev) {
@@ -720,6 +737,62 @@ class Awdio {
     }
     if (this._pageHideHandler) {
       window.removeEventListener('pagehide', this._pageHideHandler);
+    }
+  }
+
+  // ==================== 设备断开自动降级 ====================
+
+  /**
+   * 全局设备变化监听（单例，所有实例共享）
+   */
+  static _setupDeviceChangeWatch() {
+    if (Awdio._deviceChangeSetup) return;
+    Awdio._deviceChangeSetup = true;
+
+    navigator.mediaDevices.addEventListener('devicechange', async () => {
+      // 获取当前可用输出设备列表
+      let available = [];
+      try {
+        let devices = await navigator.mediaDevices.enumerateDevices();
+        available = devices.filter(d => d.kind === 'audiooutput').map(d => d.deviceId);
+      } catch (e) {
+        return; // 无法枚举，不处理
+      }
+
+      // 遍历所有注册了实例级设备的实例
+      for (let inst of Awdio._deviceChangeInstances) {
+        if (inst._destroyed || !inst._device) continue;
+
+        let ids = Array.isArray(inst._device) ? inst._device : [inst._device];
+        let allPresent = ids.every(id => id === 'default' || available.includes(id));
+
+        if (!allPresent) {
+          console.warn('Awdio: 输出设备已断开，自动降回扬声器。原设备:', inst._device);
+          inst._device = null;
+          inst._applyDeviceRouting();
+          inst._emit('deviceLost', { prevDevice: ids });
+        }
+      }
+    });
+  }
+
+  /**
+   * 注册设备断开监听
+   */
+  _bindDeviceWatch() {
+    if (!this._device || this._deviceChangeHandler) return;
+    Awdio._setupDeviceChangeWatch();
+    Awdio._deviceChangeInstances.add(this);
+    this._deviceChangeHandler = true;
+  }
+
+  /**
+   * 注销设备断开监听
+   */
+  _unbindDeviceWatch() {
+    if (this._deviceChangeHandler) {
+      Awdio._deviceChangeInstances.delete(this);
+      this._deviceChangeHandler = null;
     }
   }
 
@@ -1380,8 +1453,7 @@ class Awdio {
       if (arg.a !== undefined) this._a = Math.max(0, arg.a);
       if (arg.r !== undefined) this._r = Math.max(0, arg.r);
       if (arg.device !== undefined) {
-        this._device = arg.device;
-        this._applyDeviceRouting();
+        this.device(arg.device);
       }
 
       this._applyVolume();
@@ -1673,9 +1745,12 @@ class Awdio {
 
     if (deviceId === null) {
       // 恢复默认
+      this._unbindDeviceWatch();
       this._device = null;
     } else {
+      this._unbindDeviceWatch();
       this._device = deviceId;
+      this._bindDeviceWatch();
     }
 
     this._applyDeviceRouting();
@@ -2212,6 +2287,115 @@ class Awdio {
     return this;
   }
 
+  // ==================== FFT 频谱分析 ====================
+
+  /**
+   * 启用/配置/关闭频谱分析器
+   * @param {object|number|boolean} [opts] - 配置对象 / fftSize / falsy 关闭
+   *   opts.fftSize: 32~32768 的 2 的幂（默认 2048）
+   *   opts.smoothing: 时间平滑系数 0~1（默认 0.8）
+   *   opts.minDecibels: 最小分贝值（默认 -100）
+   *   opts.maxDecibels: 最大分贝值（默认 -30）
+   *
+   * 示例：.analyser()                          // 默认配置启用
+   *       .analyser({ fftSize: 512, smoothing: 0.5 })
+   *       .analyser(1024)                      // 仅设置 fftSize
+   *       .analyser(false)                     // 关闭
+   */
+  analyser(opts) {
+    if (opts === false || opts === null) {
+      if (this._analyserNode) {
+        this._analyserNode.disconnect();
+        this._analyserNode = null;
+        this._freqData = null;
+        this._timeData = null;
+        this._rebuildChain();
+      }
+      return this;
+    }
+
+    if (typeof opts === 'number') {
+      opts = { fftSize: opts };
+    }
+    if (!opts) opts = {};
+
+    let fftSize = opts.fftSize || 2048;
+    let smoothing = opts.smoothing != null ? opts.smoothing : 0.8;
+    let minDecibels = opts.minDecibels != null ? opts.minDecibels : -100;
+    let maxDecibels = opts.maxDecibels != null ? opts.maxDecibels : -30;
+
+    if (!this._analyserNode) {
+      this._analyserNode = this._ctx.createAnalyser();
+      this._rebuildChain();
+    }
+
+    this._analyserNode.fftSize = fftSize;
+    this._analyserNode.smoothingTimeConstant = smoothing;
+    this._analyserNode.minDecibels = minDecibels;
+    this._analyserNode.maxDecibels = maxDecibels;
+
+    // 预分配数据缓存
+    let binCount = this._analyserNode.frequencyBinCount;
+    this._freqData = new Uint8Array(binCount);
+    this._timeData = new Uint8Array(fftSize);
+
+    return this;
+  }
+
+  /**
+   * 获取频域数据（频谱）
+   * @param {object} [opts]
+   *   opts.normalized: 是否归一化到 0~1（默认 false，返回 0~255）
+   * @returns {Uint8Array|Float32Array} 频域数据，长度 = fftSize/2
+   */
+  freqData(opts) {
+    if (!this._analyserNode) return null;
+    let normalized = opts && opts.normalized;
+
+    if (!this._freqData || this._freqData.length !== this._analyserNode.frequencyBinCount) {
+      this._freqData = new Uint8Array(this._analyserNode.frequencyBinCount);
+    }
+
+    this._analyserNode.getByteFrequencyData(this._freqData);
+
+    if (normalized) {
+      let result = new Float32Array(this._freqData.length);
+      for (let i = 0; i < this._freqData.length; i++) {
+        result[i] = this._freqData[i] / 255;
+      }
+      return result;
+    }
+
+    return this._freqData;
+  }
+
+  /**
+   * 获取时域波形数据
+   * @param {object} [opts]
+   *   opts.normalized: 是否归一化到 -1~1（默认 false，返回 0~255）
+   * @returns {Uint8Array|Float32Array} 时域数据，长度 = fftSize
+   */
+  timeData(opts) {
+    if (!this._analyserNode) return null;
+    let normalized = opts && opts.normalized;
+
+    if (!this._timeData || this._timeData.length !== this._analyserNode.fftSize) {
+      this._timeData = new Uint8Array(this._analyserNode.fftSize);
+    }
+
+    this._analyserNode.getByteTimeDomainData(this._timeData);
+
+    if (normalized) {
+      let result = new Float32Array(this._timeData.length);
+      for (let i = 0; i < this._timeData.length; i++) {
+        result[i] = (this._timeData[i] - 128) / 128;
+      }
+      return result;
+    }
+
+    return this._timeData;
+  }
+
   // ==================== 参数 a / r / param ====================
 
   /**
@@ -2559,8 +2743,10 @@ class Awdio {
     if (this._phaserNode) this._phaserNode.disconnect();
     if (this._stereoPanner) this._stereoPanner.disconnect();
     if (this._pannerNode) this._pannerNode.disconnect();
+    if (this._analyserNode) this._analyserNode.disconnect();
     this._gainNode.disconnect();
     this._unbindVisibility();
+    this._unbindDeviceWatch();
     Awdio._instances.delete(this._name);
 
     this._emit('destroy', { name: this._name });
@@ -2811,7 +2997,7 @@ class _AwdioManager {
   // ==================== 导出 ====================
   return Awdio;
 
-}));
+});
 
 // 别名 Aw
 if (typeof window !== 'undefined') { window.Aw = window.Awdio; }

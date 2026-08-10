@@ -139,7 +139,13 @@ declare class Awdio {
 
   // ==================== 事件系统 ====================
 
-  /** 注册事件 */
+  /**
+   * 注册事件
+   * 支持事件：'play' | 'pause' | 'stop' | 'end' | 'load' | 'progress' | 'error' | 'destroy' | 'deviceLost'
+   *
+   * 'deviceLost' - 输出设备断开时触发，自动降回扬声器
+   *   data: { prevDevice: string[] } - 断开的设备 ID 列表
+   */
   on(event: string, fn: (data?: any) => void): this;
   /** 移除事件 */
   off(event: string, fn: (data?: any) => void): this;
@@ -392,6 +398,33 @@ declare class Awdio {
  */
   envelope(opts?: EnvelopeOptions | false | null): this;
 
+  // ==================== FFT 频谱分析 ====================
+
+  /**
+   * 启用/配置/关闭频谱分析器（AnalyserNode）
+   * @param opts - 配置对象 / fftSize数值 / falsy关闭
+   *
+   * 示例：.analyser()                          // 默认配置启用
+   *       .analyser({ fftSize: 512, smoothing: 0.5 })
+   *       .analyser(1024)                      // 仅设置 fftSize
+   *       .analyser(false)                     // 关闭
+   */
+  analyser(opts?: AnalyserOptions | number | false | null): this;
+
+  /**
+   * 获取频域数据（频谱）
+   * @param opts - { normalized: true } 返回 0~1 的 Float32Array，否则返回 0~255 的 Uint8Array
+   * @returns 频域数据，长度 = fftSize/2；未启用时返回 null
+   */
+  freqData(opts?: { normalized?: boolean }): Uint8Array | Float32Array | null;
+
+  /**
+   * 获取时域波形数据
+   * @param opts - { normalized: true } 返回 -1~1 的 Float32Array，否则返回 0~255 的 Uint8Array
+   * @returns 时域数据，长度 = fftSize；未启用时返回 null
+   */
+  timeData(opts?: { normalized?: boolean }): Uint8Array | Float32Array | null;
+
   // ==================== 参数 a / r / param ====================
 
   /**
@@ -590,6 +623,18 @@ interface PhaserOptions {
   fb?: number;
   /** 移相阶数 2-12（默认 4） */
   stages?: number;
+}
+
+/** FFT 频谱分析器选项 */
+interface AnalyserOptions {
+  /** FFT 窗口大小，32~32768 的 2 的幂（默认 2048） */
+  fftSize?: number;
+  /** 时间平滑系数 0~1（默认 0.8） */
+  smoothing?: number;
+  /** 最小分贝值（默认 -100） */
+  minDecibels?: number;
+  /** 最大分贝值（默认 -30） */
+  maxDecibels?: number;
 }
 
 /** 拨弦选项 */
