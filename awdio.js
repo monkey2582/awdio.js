@@ -19,6 +19,7 @@ class Awdio {
   static _counter = 0;
   static _instances = new Map();
   static _globalVolume = 100;
+  static _globalMuted = false;
   static _globalGainNode = null;
   static _ctx = null;
 
@@ -75,6 +76,33 @@ class Awdio {
 
   static getGlobalVolume() {
     return Awdio._globalVolume;
+  }
+
+  /**
+   * 全局静音
+   * @param {boolean} [val] - true 静音 / false 取消静音 / 不传切换
+   */
+  static mute(val) {
+    if (val === undefined) {
+      Awdio._globalMuted = !Awdio._globalMuted;
+    } else {
+      Awdio._globalMuted = !!val;
+    }
+    Awdio.getGlobalGainNode().gain.value = Awdio._globalMuted ? 0 : Awdio._globalVolume / 100;
+  }
+
+  /**
+   * 停止所有实例
+   * @param {boolean} [fade] - 是否先淡出再停止
+   */
+  static stopAll(fade) {
+    Awdio._instances.forEach(inst => {
+      if (fade && inst.playing) {
+        inst.fadeOut(0.15);
+      } else {
+        inst.stop();
+      }
+    });
   }
 
   /**
@@ -482,6 +510,9 @@ class Awdio {
     this._a = opts.a != null ? Math.max(0, opts.a) : 0.01;
     this._r = opts.r != null ? Math.max(0, opts.r) : 0.3;
     this._params = {}; // 通用参数存储
+    this._clip = opts.clip || null; // 音频片段映射 { name: [startMs, endMs] }
+    this._clipActive = null;  // 当前激活的片段 [offsetSec, durationSec]
+    this._clipSlice = opts._clipSlice || null; // clip() 创建的临时片段 [offsetSec, durationSec]
 
     // 命名
     this._name = opts.name || ('awdio_' + (++Awdio._counter));
@@ -1208,8 +1239,23 @@ class Awdio {
     }
 
     let offset = this._pausedAt != null ? this._pausedAt : 0;
-    source.start(0, offset);
-    source.__startTime = this._ctx.currentTime - offset;
+    let duration;
+    // clip 片段播放：覆盖 offset 和 duration
+    if (this._clipActive) {
+      offset = this._clipActive[0];
+      duration = this._clipActive[1];
+      this._clipActive = null;
+    } else if (this._clipSlice) {
+      offset = this._clipSlice[0];
+      duration = this._clipSlice[1];
+    }
+    if (duration != null) {
+      source.start(0, offset, duration);
+      source.__startTime = this._ctx.currentTime - offset;
+    } else {
+      source.start(0, offset);
+      source.__startTime = this._ctx.currentTime - offset;
+    }
 
     this._activeSources.push(source);
     this._pausedAt = null;
@@ -1308,7 +1354,13 @@ class Awdio {
     if (this._destroyed) return this;
 
     if (arg !== undefined) {
-      this._handleArg(arg);
+      // clip 名称优先：play('laser') → 设置 _clipActive
+      if (typeof arg === 'string' && this._clip && this._clip[arg]) {
+        let [startMs, endMs] = this._clip[arg];
+        this._clipActive = [startMs / 1000, (endMs - startMs) / 1000];
+      } else {
+        this._handleArg(arg);
+      }
     }
 
     if (this._delayMs > 0) {
@@ -1452,6 +1504,7 @@ class Awdio {
       if (arg.reverse !== undefined) this.reverse(arg.reverse);
       if (arg.a !== undefined) this._a = Math.max(0, arg.a);
       if (arg.r !== undefined) this._r = Math.max(0, arg.r);
+      if (arg.clip !== undefined) this._clip = arg.clip || null;
       if (arg.device !== undefined) {
         this.device(arg.device);
       }
@@ -1611,6 +1664,7 @@ class Awdio {
       reverse: this._reverse,
       a: this._a,
       r: this._r,
+      clip: this._clip ? { ...this._clip } : null,
       params: { ...this._params },
       destroyed: this._destroyed
     };
@@ -2711,6 +2765,61 @@ class Awdio {
     let newInstance = new Awdio(currentOpts);
     this._emit('clone', { instance: newInstance, opts: arg });
     return newInstance;
+  }
+
+  // ==================== 音频片段 (clip) ====================
+
+  /**
+   * 定义命名片段
+   * @param {string} name - 片段名称，之后可通过 .play(name) 播放
+   * @param {number} from - 起始时间 毫秒
+   * @param {number} to - 结束时间 毫秒
+   * @returns {Awdio} this
+   *
+   * 示例：sfx.defineClip('laser', 0, 500).defineClip('boom', 1000, 2000)
+   *       sfx.play('laser')
+   */
+  defineClip(name, from, to) {
+    if (!this._clip) this._clip = {};
+    this._clip[name] = [Math.max(0, from || 0), Math.max(from, to || from + 1000)];
+    return this;
+  }
+
+  /**
+   * 创建音频片段的新实例（共享源 buffer，不重复加载）
+   * @param {number} start - 起始时间 毫秒
+   * @param {number} [end] - 结束时间 毫秒（不传则到末尾）
+   * @returns {Awdio} 新的 Awdio 实例，仅播放该片段
+   *
+   * 示例：sfx.clip(0, 1000).play()   // 播放 0~1000ms
+   *       sfx.clip(2000).play()      // 播放 2000ms 到末尾
+   */
+  clip(start, end) {
+    let startMs = Math.max(0, start || 0);
+    let endMs;
+    if (end != null) {
+      endMs = Math.max(startMs, end);
+    } else if (this._buffer) {
+      endMs = this._buffer.duration * 1000;
+    } else {
+      endMs = startMs + 1000;
+    }
+    let durationMs = endMs - startMs;
+
+    let opts = this.getOption();
+    delete opts.name;
+    opts.autoplay = false;
+    opts._clipSlice = [startMs / 1000, durationMs / 1000];
+
+    let sliced = new Awdio(opts);
+    // 共享父实例的 buffer（避免重复加载）
+    if (this._buffer) {
+      sliced._buffer = this._buffer;
+    }
+    // clip 默认 poly 模式，允许多片段同时播放
+    sliced._poly = true;
+
+    return sliced;
   }
 
   // ==================== destroy 方法 ====================

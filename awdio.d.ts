@@ -24,6 +24,18 @@ declare class Awdio {
   static getGlobalVolume(): number;
 
   /**
+   * 全局静音
+   * @param val - true 静音 / false 取消 / 不传切换
+   */
+  static mute(val?: boolean): void;
+
+  /**
+   * 停止所有实例
+   * @param fade - 是否先淡出再停止
+   */
+  static stopAll(fade?: boolean): void;
+
+  /**
    * 获取所有音频输出设备
    * @returns 设备列表 [{ deviceId, label, groupId }]
    */
@@ -154,11 +166,13 @@ declare class Awdio {
 
   /**
    * 播放
-   * @param arg - 字符串（类型/URL/路径）、函数（公式）、或选项对象，传入时先设置再播放
+   * @param arg - 字符串（clip 名称/类型/URL/路径）、函数（公式）、或选项对象
    *
+   * clip 模式：若配置了 clip 或通过 defineClip 定义了片段，且 arg 匹配片段名称，则播放对应片段
    * 示例: .play()
    *       .play({ volume: 50 })
    *       .play("sine")
+   *       .play("laser")        // clip 名称（需配置 clip 或 defineClip）
    *       .play(myFormulaFn)
    */
   play(arg?: string | Partial<AwdioOptions> | ((t: number, freq: number, sr: number, opts: Readonly<AwdioOptions>) => number)): this;
@@ -525,6 +539,31 @@ declare class Awdio {
    */
   clone(arg?: string | Partial<AwdioOptions> | ((t: number, freq: number, sr: number, opts: Readonly<AwdioOptions>) => number)): Awdio;
 
+  // ==================== 音频片段 (clip) ====================
+
+  /**
+   * 定义命名片段
+   * @param name - 片段名称，之后可通过 .play(name) 播放
+   * @param from - 起始时间 毫秒
+   * @param to - 结束时间 毫秒
+   * @returns this
+   *
+   * 示例：sfx.defineClip('laser', 0, 500).defineClip('boom', 1000, 2000)
+   *       sfx.play('laser')
+   */
+  defineClip(name: string, from: number, to: number): this;
+
+  /**
+   * 创建音频片段的新实例（共享源 buffer，不重复加载）
+   * @param start - 起始时间 毫秒
+   * @param end - 结束时间 毫秒（不传则到末尾）
+   * @returns 新的 Awdio 实例，仅播放该片段
+   *
+   * 示例：sfx.clip(0, 1000).play()   // 播放 0~1000ms
+   *       sfx.clip(2000).play()      // 播放 2000ms 到末尾
+   */
+  clip(start: number, end?: number): Awdio;
+
   // ==================== destroy 方法 ====================
 
   /** 销毁实例 */
@@ -672,6 +711,14 @@ interface AwdioOptions {
   autoplay?: boolean;
   /** 播放完毕后自动销毁实例（默认 false） */
   autoDestroy?: boolean;
+  /**
+   * 音频片段映射，支持按名称播放片段
+   * 格式：{ name: [startMs, endMs] }
+   *
+   * 示例：clip: { laser: [0, 1000], explosion: [2000, 3000] }
+   *       sfx.play('laser')  // 播放 0~1000ms
+   */
+  clip?: Record<string, [number, number]>;
   /** 是否静音 */
   muted?: boolean;
   /** 实例名称 */
