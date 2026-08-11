@@ -30,6 +30,9 @@ class Awdio {
   static _deviceChangeInstances = new Set();
   static _deviceChangeSetup = false;
 
+  /** 活跃的 queue/playAll 管理器 */
+  static _managers = new Set();
+
   /** 已知波形类型列表 */
   static _waveTypes = [
     // 基础波形
@@ -92,17 +95,51 @@ class Awdio {
   }
 
   /**
-   * 停止所有实例
-   * @param {boolean} [fade] - 是否先淡出再停止
+   * 停止所有实例及队列（淡出后停止）
    */
-  static stopAll(fade) {
+  static stopAll() {
     Awdio._instances.forEach(inst => {
-      if (fade && inst.playing) {
+      if (inst.playing) {
         inst.fadeOut(0.15);
       } else {
         inst.stop();
       }
     });
+    Awdio._managers.forEach(mgr => mgr.stop());
+    Awdio._managers.clear();
+  }
+
+  /**
+   * 暂停/恢复所有实例及队列
+   * @param {boolean} [val] - true 暂停（默认）/ false 恢复
+   */
+  static pauseAll(val) {
+    if (val === undefined) val = true;
+    if (val) {
+      Awdio._instances.forEach(inst => {
+        if (inst.playing) {
+          inst._wasPausedByGlobal = true;
+          inst._pauseInternal();
+        }
+      });
+      Awdio._managers.forEach(mgr => {
+        mgr._wasPausedByGlobal = true;
+        mgr.pause();
+      });
+    } else {
+      Awdio._instances.forEach(inst => {
+        if (inst._wasPausedByGlobal) {
+          inst._wasPausedByGlobal = false;
+          inst._play();
+        }
+      });
+      Awdio._managers.forEach(mgr => {
+        if (mgr._wasPausedByGlobal) {
+          mgr._wasPausedByGlobal = false;
+          mgr.play();
+        }
+      });
+    }
   }
 
   /**
@@ -373,6 +410,7 @@ class Awdio {
 
     let instances = entries.filter(e => e.item).map(e => e.item);
     let mgr = new _AwdioManager(instances, opts, 'sequential');
+    Awdio._managers.add(mgr);
     // 注入逐项延迟
     mgr._perItemDelays = entries.map(e => e.delayAfter);
     return mgr;
@@ -413,6 +451,7 @@ class Awdio {
 
     let instances = entries.filter(e => e.item).map(e => e.item);
     let mgr = new _AwdioManager(instances, opts, 'parallel');
+    Awdio._managers.add(mgr);
     mgr._perItemDelays = entries.map(e => e.delayAfter);
     return mgr;
   }
@@ -528,6 +567,7 @@ class Awdio {
     this._delayMs = 0;
     this._destroyed = false;
     this._wasPlayingBeforeHidden = false;
+    this._wasPausedByGlobal = false;
     this._isLoading = false;
     this._releasing = false;
     this._releaseTimeoutId = null;
@@ -2883,6 +2923,7 @@ class _AwdioManager {
     this._playing = false;
     this._paused = false;
     this._stopped = false;
+    this._wasPausedByGlobal = false;
     this._timeoutId = null;
     this._currentPlaying = null;
     this._events = {};
@@ -2904,6 +2945,9 @@ class _AwdioManager {
     (this._events[event] || []).forEach(fn => {
       try { fn.call(this, data); } catch (e) {}
     });
+    if (event === 'end') {
+      Awdio._managers.delete(this);
+    }
   }
 
   play(...indices) {
@@ -2964,6 +3008,7 @@ class _AwdioManager {
     this._items.forEach(item => item.stop());
     this._currentIndex = -1;
     this._currentPlaying = null;
+    Awdio._managers.delete(this);
     this._emit('stop');
     return this;
   }

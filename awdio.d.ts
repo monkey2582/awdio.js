@@ -30,10 +30,15 @@ declare class Awdio {
   static mute(val?: boolean): void;
 
   /**
-   * 停止所有实例
-   * @param fade - 是否先淡出再停止
+   * 停止所有实例及队列（淡出后停止）
    */
-  static stopAll(fade?: boolean): void;
+  static stopAll(): void;
+
+  /**
+   * 暂停/恢复所有实例及队列
+   * @param val - true 暂停（默认）/ false 恢复
+   */
+  static pauseAll(val?: boolean): void;
 
   /**
    * 获取所有音频输出设备
