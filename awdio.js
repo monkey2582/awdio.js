@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
  * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
- * @version 3.10.0
+ * @version 3.11.0
  */
 !(function(root,factory){
   if (typeof define === 'function' && define.amd) {
@@ -75,10 +75,24 @@ class Awdio {
   static setGlobalVolume(vol) {
     Awdio._globalVolume = Math.max(0, Math.min(100, vol));
     Awdio.getGlobalGainNode().gain.value = Awdio._globalVolume / 100;
+    Awdio._syncHtmlAudioVolumes();
   }
 
   static getGlobalVolume() {
     return Awdio._globalVolume;
+  }
+
+  /**
+   * 同步所有 HTML5 音频实例的音量（跟随全局 mute/volume）
+   */
+  static _syncHtmlAudioVolumes() {
+    if (!Awdio._htmlAudioInstances) return;
+    Awdio._htmlAudioInstances.forEach(inst => {
+      if (inst._destroyed || !inst._htmlAudio) return;
+      let individualVol = inst._muted ? 0 : inst._volume / 100;
+      let globalScale = Awdio._globalMuted ? 0 : Awdio._globalVolume / 100;
+      inst._htmlAudio.volume = individualVol * globalScale;
+    });
   }
 
   /**
@@ -92,6 +106,7 @@ class Awdio {
       Awdio._globalMuted = !!val;
     }
     Awdio.getGlobalGainNode().gain.value = Awdio._globalMuted ? 0 : Awdio._globalVolume / 100;
+    Awdio._syncHtmlAudioVolumes();
   }
 
   /**
@@ -342,7 +357,7 @@ class Awdio {
     // 末尾是选项对象则提取
     let last = raw[raw.length - 1];
     if (last && typeof last === 'object' && !Array.isArray(last) && !(last instanceof Awdio) && typeof last !== 'function') {
-      let hasQueueOpts = ['loop', 'delay', 'fade', 'fadeIn', 'fadeOut', 'fadeDuration', 'fadeInDuration', 'fadeOutDuration', 'autoplay'].some(k => k in last);
+      let hasQueueOpts = ['loop', 'delay', 'fade', 'fadeIn', 'fadeOut', 'fadeDuration', 'fadeInDuration', 'fadeOutDuration', 'autoplay', 'pauseOnBack'].some(k => k in last);
       if (hasQueueOpts) {
         opts = raw.pop();
       }
@@ -546,6 +561,11 @@ class Awdio {
     this._speed = opts.speed != null ? Math.max(0.1, Math.min(10, opts.speed)) : 1;
     this._pitch = opts.pitch != null ? Math.max(0.1, Math.min(10, opts.pitch)) : 1;
     this._reverse = opts.reverse || false;
+    this._pauseOnBack = opts.pauseOnBack !== undefined ? opts.pauseOnBack : true;
+    // 自动判断是否使用 HTML5 Audio：仅网络链接(src 是 http/https URL)有效，音波/本地音乐忽略 html 参数
+    let _isNetworkSrc = this._src && (Awdio._isURL(this._src) && !Awdio._isDataURI(this._src));
+    this._useHtmlAudio = _isNetworkSrc ? (opts.html !== undefined ? opts.html : true) : false;
+    this._htmlAudio = null;
     this._a = opts.a != null ? Math.max(0, opts.a) : 0.01;
     this._r = opts.r != null ? Math.max(0, opts.r) : 0.3;
     this._params = {}; // 通用参数存储
@@ -572,6 +592,7 @@ class Awdio {
     this._releasing = false;
     this._releaseTimeoutId = null;
     this._reversedBuffer = null;
+    this._htmlClipTimer = null; // HTML5 clip 超时定时器
 
     // 实例级设备
     if (opts.device) {
@@ -585,7 +606,12 @@ class Awdio {
 
     // 加载或合成：优先级 src > formula > type
     if (this._src) {
-      this._load();
+      if (this._useHtmlAudio) {
+        this._createHtmlAudio();
+        if (this._autoplay) this._play();
+      } else {
+        this._load();
+      }
     } else if (this._formula) {
       this._buffer = this._createBuffer(this._formula, this._freq);
       if (this._autoplay) this._play();
@@ -776,17 +802,97 @@ class Awdio {
     }
   }
 
+  // ==================== HTML5 Audio 回退 ====================
+
+  /**
+   * 创建 HTML5 AudioElement 用于替代 Web Audio API 播放
+   * 解决 CORS 跨域问题，当网络音频无法通过 fetch 获取时使用
+   */
+  _createHtmlAudio() {
+    if (this._htmlAudio) return;
+    this._htmlAudio = document.createElement('audio');
+    this._htmlAudio.src = this._src;
+    this._htmlAudio.loop = this._loop;
+    this._htmlAudio.playbackRate = this._speed * this._pitch;
+    this._htmlAudio.volume = this._muted ? 0 : this._volume / 100;
+
+    // 设备路由
+    if (this._device) {
+      this._applyHtmlDevice();
+    }
+
+    let onPlay = () => this._emit('play');
+    let onPause = () => { this._emit('pause'); };
+    let onEnded = () => {
+      this._emit('end');
+      if (!this._loop && this._autoDestroy) this.destroy();
+    };
+    let onError = (e) => {
+      console.warn('Awdio: HTML5 音频加载失败，尝试回退到 Web Audio API', this._src);
+      this._emit('error', { error: e, src: this._src });
+      // CORS 错误时尝试回退到 Web Audio API
+      this._useHtmlAudio = false;
+      this._htmlAudio.remove();
+      this._htmlAudio = null;
+      this._load();
+    };
+    let onTimeUpdate = () => {
+      this._emit('progress', {
+        loaded: this._htmlAudio.currentTime,
+        total: this._htmlAudio.duration || 0,
+        percent: this._htmlAudio.duration ? Math.round(this._htmlAudio.currentTime / this._htmlAudio.duration * 100) : 0
+      });
+    };
+    let onLoaded = () => {
+      this._emit('load', { src: this._src });
+    };
+
+    this._htmlAudio.addEventListener('play', onPlay);
+    this._htmlAudio.addEventListener('pause', onPause);
+    this._htmlAudio.addEventListener('ended', onEnded);
+    this._htmlAudio.addEventListener('error', onError);
+    this._htmlAudio.addEventListener('timeupdate', onTimeUpdate);
+    this._htmlAudio.addEventListener('loadedmetadata', onLoaded);
+
+    // 存储引用以便清理
+    this._htmlAudioListeners = { onPlay, onPause, onEnded, onError, onTimeUpdate, onLoaded };
+
+    // 注册到全局 HTML5 实例列表，用于全局 mute/volume 同步
+    if (!Awdio._htmlAudioInstances) Awdio._htmlAudioInstances = new Set();
+    Awdio._htmlAudioInstances.add(this);
+  }
+
+  /**
+   * 将 HTML5 Audio 输出到指定设备
+   */
+  _applyHtmlDevice() {
+    if (!this._htmlAudio || !this._device) return;
+    let ids = Array.isArray(this._device) ? this._device : [this._device];
+    // 多设备：创建额外 audio 元素，走 MediaStream 方案
+    if (ids.length > 1) {
+      this._applyDeviceRouting(); // 回退到 Web Audio 多设备方案
+      return;
+    }
+    let id = ids[0];
+    if (id === 'default') return;
+    if (this._htmlAudio.setSinkId) {
+      this._htmlAudio.setSinkId(id).catch(e => {
+        console.warn('Awdio: HTML5 setSinkId 失败:', id, e);
+      });
+    }
+  }
+
   // ==================== 可见性处理 ====================
 
   _bindVisibility() {
     this._visibilityHandler = () => {
       if (document.hidden) {
-        if (this.playing) {
+        if (this.playing && this._pauseOnBack) {
           this._wasPlayingBeforeHidden = true;
           this._pauseInternal();
         }
       } else {
-        if (this._wasPlayingBeforeHidden) {
+        if (this._wasPlayingBeforeHidden && this._pauseOnBack) {
           this._wasPlayingBeforeHidden = false;
           this._play();
         }
@@ -794,7 +900,7 @@ class Awdio {
     };
     document.addEventListener('visibilitychange', this._visibilityHandler);
     this._pageHideHandler = () => {
-      if (this.playing) {
+      if (this.playing && this._pauseOnBack) {
         this._wasPlayingBeforeHidden = true;
         this._pauseInternal();
       }
@@ -1238,6 +1344,47 @@ class Awdio {
 
   _play() {
     if (this._destroyed) return;
+
+    // HTML5 音频模式
+    if (this._useHtmlAudio) {
+      if (!this._htmlAudio) this._createHtmlAudio();
+      // clip 片段处理
+      let clipOffset = null, clipDuration = null;
+      if (this._clipActive) {
+        clipOffset = this._clipActive[0];
+        clipDuration = this._clipActive[1];
+        this._clipActive = null;
+      } else if (this._clipSlice) {
+        clipOffset = this._clipSlice[0];
+        clipDuration = this._clipSlice[1];
+      }
+      if (this._pausedAt != null) {
+        this._htmlAudio.currentTime = clipOffset != null ? clipOffset + this._pausedAt : this._pausedAt;
+        this._pausedAt = null;
+      } else if (clipOffset != null) {
+        this._htmlAudio.currentTime = clipOffset;
+      }
+      // 同步 loop 状态
+      this._htmlAudio.loop = this._loop;
+      this._htmlAudio.playbackRate = this._speed * this._pitch;
+      this._htmlAudio.play().catch(e => {
+        console.warn('Awdio: HTML5 音频播放失败', e);
+        this._emit('error', { error: e, src: this._src });
+      });
+      // clip 时长限制：到时间自动停止
+      if (clipDuration != null && !this._loop) {
+        if (this._htmlClipTimer) clearTimeout(this._htmlClipTimer);
+        this._htmlClipTimer = setTimeout(() => {
+          if (this._htmlAudio) {
+            this._htmlAudio.pause();
+            this._emit('end');
+            if (this._autoDestroy) this.destroy();
+          }
+        }, clipDuration * 1000);
+      }
+      return;
+    }
+
     if (!this._buffer) {
       console.warn('Awdio: 音频尚未就绪');
       return;
@@ -1326,6 +1473,12 @@ class Awdio {
   }
 
   _pauseInternal() {
+    // HTML5 音频模式
+    if (this._useHtmlAudio && this._htmlAudio) {
+      this._htmlAudio.pause();
+      return;
+    }
+
     // 淡出暂停
     if (this._fadeOut && this._activeSources.length > 0) {
       let now = this._ctx.currentTime;
@@ -1363,6 +1516,13 @@ class Awdio {
   }
 
   _stopAllSources() {
+    // HTML5 音频模式
+    if (this._useHtmlAudio && this._htmlAudio) {
+      this._htmlAudio.pause();
+      this._htmlAudio.currentTime = 0;
+      return;
+    }
+
     // ADSR 释放阶段
     if (this._envelopeNode && this._envelope && this._activeSources.length > 0 && !this._releasing) {
       this._releasing = true;
@@ -1443,6 +1603,11 @@ class Awdio {
 
   seek(time) {
     let seconds = Awdio._parseTime(time);
+    // HTML5 音频模式
+    if (this._useHtmlAudio && this._htmlAudio) {
+      this._htmlAudio.currentTime = Math.max(0, seconds);
+      return this;
+    }
     if (this._activeSources.length > 0) {
       let wasLooping = this._loop;
       this._loop = false;
@@ -1493,17 +1658,27 @@ class Awdio {
         this._src = arg.src;
         this._formula = null;
         this._type = null;
-        this._load();
+        // 仅网络链接启用 HTML5 Audio，其他忽略
+        let isNet = (Awdio._isURL(this._src) && !Awdio._isDataURI(this._src));
+        this._useHtmlAudio = isNet;
+        if (this._useHtmlAudio) {
+          if (this._htmlAudio) { this._htmlAudio.remove(); this._htmlAudio = null; }
+          this._createHtmlAudio();
+        } else {
+          this._load();
+        }
       } else if (hasFormula) {
         // formula 第二优先级
         this._formula = arg.formula;
         this._type = arg.formula;
         this._src = null;
+        this._useHtmlAudio = false;
         this._buffer = this._createBuffer(arg.formula, this._freq);
       } else if (hasType) {
         // type 第三优先级
         this._type = arg.type;
         this._src = null;
+        this._useHtmlAudio = false;
         if (typeof arg.type === 'function') {
           this._formula = arg.type;
         } else if (Awdio._formulas.has(arg.type)) {
@@ -1522,7 +1697,12 @@ class Awdio {
         }
       }
       if (arg.volume !== undefined) this._volume = Math.max(0, Math.min(100, arg.volume));
-      if (arg.loop !== undefined) this._loop = arg.loop;
+      if (arg.loop !== undefined) {
+        this._loop = arg.loop;
+        if (this._useHtmlAudio && this._htmlAudio) {
+          this._htmlAudio.loop = this._loop;
+        }
+      }
       if (arg.poly !== undefined) this._poly = arg.poly;
       if (arg.autoplay !== undefined) this._autoplay = arg.autoplay;
       if (arg.autoDestroy !== undefined) this._autoDestroy = arg.autoDestroy;
@@ -1548,6 +1728,22 @@ class Awdio {
       if (arg.device !== undefined) {
         this.device(arg.device);
       }
+      if (arg.html !== undefined) {
+        // 仅网络链接支持 html 模式，音波/本地音乐忽略
+        let isNet = this._src && (Awdio._isURL(this._src) && !Awdio._isDataURI(this._src));
+        this._useHtmlAudio = isNet ? !!arg.html : false;
+        if (this._useHtmlAudio && this._src && !this._htmlAudio) {
+          this._createHtmlAudio();
+        }
+        if (!this._useHtmlAudio && this._htmlAudio) {
+          this._htmlAudio.remove();
+          this._htmlAudio = null;
+          if (this._src) this._load();
+        }
+      }
+      if (arg.pauseOnBack !== undefined) {
+        this._pauseOnBack = !!arg.pauseOnBack;
+      }
 
       this._applyVolume();
     }
@@ -1563,21 +1759,32 @@ class Awdio {
       this._formula = arg;
       this._type = arg;
       this._src = null;
+      this._useHtmlAudio = false;
       this._buffer = this._createBuffer(arg, this._freq);
     } else if (typeof arg === 'string') {
       if (Awdio._isWaveType(arg)) {
         this._type = arg;
         this._formula = Awdio._formulas.get(arg) || null;
+        this._useHtmlAudio = false;
         this._buffer = this._createBuffer(arg, this._freq);
       } else if (Awdio._isURL(arg) || Awdio._isDataURI(arg)) {
         this._src = arg;
         this._formula = null;
         this._type = null;
-        this._load();
+        // 仅网络链接启用 HTML5 Audio，data URI 用 Web Audio
+        let isNet = (Awdio._isURL(arg) && !Awdio._isDataURI(arg));
+        this._useHtmlAudio = isNet;
+        if (this._useHtmlAudio) {
+          if (this._htmlAudio) { this._htmlAudio.remove(); this._htmlAudio = null; }
+          this._createHtmlAudio();
+        } else {
+          this._load();
+        }
       } else {
         this._src = arg;
         this._formula = null;
         this._type = null;
+        this._useHtmlAudio = false;
         this._load();
       }
     } else if (arg && typeof arg === 'object') {
@@ -1608,6 +1815,11 @@ class Awdio {
 
   _applyVolume() {
     this._gainNode.gain.value = this._muted ? 0 : this._volume / 100;
+    if (this._useHtmlAudio && this._htmlAudio) {
+      let individualVol = this._muted ? 0 : this._volume / 100;
+      let globalScale = Awdio._globalMuted ? 0 : Awdio._globalVolume / 100;
+      this._htmlAudio.volume = individualVol * globalScale;
+    }
   }
 
   // ==================== 增益运算 ====================
@@ -1706,6 +1918,8 @@ class Awdio {
       r: this._r,
       clip: this._clip ? { ...this._clip } : null,
       params: { ...this._params },
+      html: this._useHtmlAudio,
+      pauseOnBack: this._pauseOnBack,
       destroyed: this._destroyed
     };
   }
@@ -1718,7 +1932,18 @@ class Awdio {
 
   set src(val) {
     this._src = val;
-    this._load();
+    // 仅网络链接启用 HTML5 Audio，音波/本地音乐忽略
+    let isNetwork = (Awdio._isURL(val) && !Awdio._isDataURI(val));
+    this._useHtmlAudio = isNetwork;
+    if (this._useHtmlAudio) {
+      if (this._htmlAudio) {
+        this._htmlAudio.remove();
+        this._htmlAudio = null;
+      }
+      this._createHtmlAudio();
+    } else {
+      this._load();
+    }
   }
 
   get volume() {
@@ -1730,6 +1955,9 @@ class Awdio {
   }
 
   get currentTime() {
+    if (this._useHtmlAudio && this._htmlAudio) {
+      return this._htmlAudio.currentTime;
+    }
     if (this._activeSources.length > 0) {
       return this._ctx.currentTime - (this._activeSources[0].__startTime || 0);
     }
@@ -1741,6 +1969,9 @@ class Awdio {
   }
 
   get duration() {
+    if (this._useHtmlAudio && this._htmlAudio) {
+      return this._htmlAudio.duration || 0;
+    }
     if (this._formula || this._type) {
       return this._duration;
     }
@@ -1755,6 +1986,9 @@ class Awdio {
   }
 
   get playing() {
+    if (this._useHtmlAudio && this._htmlAudio) {
+      return !this._htmlAudio.paused;
+    }
     return this._activeSources.length > 0;
   }
 
@@ -1778,6 +2012,9 @@ class Awdio {
     this._activeSources.forEach(s => {
       try { s.playbackRate.value = this._speed * this._pitch; } catch (e) {}
     });
+    if (this._useHtmlAudio && this._htmlAudio) {
+      this._htmlAudio.playbackRate = this._speed * this._pitch;
+    }
     return this;
   }
 
@@ -1791,6 +2028,9 @@ class Awdio {
     this._activeSources.forEach(s => {
       try { s.playbackRate.value = this._speed * this._pitch; } catch (e) {}
     });
+    if (this._useHtmlAudio && this._htmlAudio) {
+      this._htmlAudio.playbackRate = this._speed * this._pitch;
+    }
     return this;
   }
 
@@ -1809,6 +2049,23 @@ class Awdio {
 
   fadeOut(duration) {
     let dur = duration || this._fadeOutDuration || 1;
+    // HTML5 音频模式：用 volume 线性降低模拟
+    if (this._useHtmlAudio && this._htmlAudio) {
+      let steps = 20;
+      let stepMs = dur * 1000 / steps;
+      let startVol = this._htmlAudio.volume;
+      let step = 0;
+      let interval = setInterval(() => {
+        step++;
+        this._htmlAudio.volume = Math.max(0, startVol * (1 - step / steps));
+        if (step >= steps) {
+          clearInterval(interval);
+          this.stop();
+          this._applyVolume();
+        }
+      }, stepMs);
+      return this;
+    }
     let now = this._ctx.currentTime;
     this._gainNode.gain.cancelScheduledValues(now);
     this._gainNode.gain.setValueAtTime(this._gainNode.gain.value, now);
@@ -1847,7 +2104,12 @@ class Awdio {
       this._bindDeviceWatch();
     }
 
-    this._applyDeviceRouting();
+    // HTML5 模式：直接设置 audio 元素 sink
+    if (this._useHtmlAudio && this._htmlAudio) {
+      this._applyHtmlDevice();
+    } else {
+      this._applyDeviceRouting();
+    }
     return this;
   }
 
@@ -2868,6 +3130,26 @@ class Awdio {
     if (this._destroyed) return;
     this._destroyed = true;
 
+    // 清理 HTML5 音频
+    if (this._htmlAudio) {
+      this._htmlAudio.pause();
+      this._htmlAudio.src = '';
+      if (this._htmlAudioListeners) {
+        this._htmlAudio.removeEventListener('play', this._htmlAudioListeners.onPlay);
+        this._htmlAudio.removeEventListener('pause', this._htmlAudioListeners.onPause);
+        this._htmlAudio.removeEventListener('ended', this._htmlAudioListeners.onEnded);
+        this._htmlAudio.removeEventListener('error', this._htmlAudioListeners.onError);
+        this._htmlAudio.removeEventListener('timeupdate', this._htmlAudioListeners.onTimeUpdate);
+        this._htmlAudio.removeEventListener('loadedmetadata', this._htmlAudioListeners.onLoaded);
+        this._htmlAudioListeners = null;
+      }
+      this._htmlAudio.remove();
+      this._htmlAudio = null;
+    }
+    if (this._htmlClipTimer) { clearTimeout(this._htmlClipTimer); this._htmlClipTimer = null; }
+    // 从全局 HTML5 实例列表中移除
+    if (Awdio._htmlAudioInstances) Awdio._htmlAudioInstances.delete(this);
+
     this._stopAllSources();
     if (this._releaseTimeoutId) clearTimeout(this._releaseTimeoutId);
     if (this._chorusLFO) { try { this._chorusLFO.stop(); this._chorusLFO.disconnect(); } catch (e) {} }
@@ -2918,6 +3200,7 @@ class _AwdioManager {
     this._fadeInDuration = opts.fadeInDuration || opts.fadeDuration || 1;
     this._fadeOutDuration = opts.fadeOutDuration || opts.fadeDuration || 1;
     this._autoplay = opts.autoplay || false;
+    this._pauseOnBack = opts.pauseOnBack !== undefined ? opts.pauseOnBack : true;
 
     this._currentIndex = -1;
     this._playing = false;
@@ -2933,6 +3216,8 @@ class _AwdioManager {
     if (this._autoplay && this._items.length > 0) {
       this.play();
     }
+
+    this._bindVisibility();
   }
 
   on(event, fn) {
@@ -2946,7 +3231,32 @@ class _AwdioManager {
       try { fn.call(this, data); } catch (e) {}
     });
     if (event === 'end') {
+      this._unbindVisibility();
       Awdio._managers.delete(this);
+    }
+  }
+
+  _bindVisibility() {
+    this._visibilityHandler = () => {
+      if (document.hidden) {
+        if (this._playing && !this._paused && this._pauseOnBack) {
+          this._wasPausedByBackground = true;
+          this.pause();
+        }
+      } else {
+        if (this._wasPausedByBackground && this._pauseOnBack) {
+          this._wasPausedByBackground = false;
+          this.play();
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', this._visibilityHandler);
+  }
+
+  _unbindVisibility() {
+    if (this._visibilityHandler) {
+      document.removeEventListener('visibilitychange', this._visibilityHandler);
+      this._visibilityHandler = null;
     }
   }
 
@@ -3008,6 +3318,7 @@ class _AwdioManager {
     this._items.forEach(item => item.stop());
     this._currentIndex = -1;
     this._currentPlaying = null;
+    this._unbindVisibility();
     Awdio._managers.delete(this);
     this._emit('stop');
     return this;
@@ -3099,6 +3410,14 @@ class _AwdioManager {
       return this;
     }
     this._items.splice(index, 1);
+    // 同步 _perItemDelays
+    if (this._perItemDelays && this._perItemDelays.length > index) {
+      this._perItemDelays.splice(index, 1);
+    }
+    // 更新 _currentIndex：如果移除的元素在当前索引之前，需要减 1
+    if (this._currentIndex > index) {
+      this._currentIndex--;
+    }
     return this;
   }
 
@@ -3106,10 +3425,15 @@ class _AwdioManager {
     let instance = Awdio._resolve(item);
     if (!instance) return this;
 
-    if (position === undefined || position >= this._items.length) {
-      this._items.push(instance);
-    } else {
-      this._items.splice(Math.max(0, position), 0, instance);
+    let pos = (position === undefined || position >= this._items.length) ? this._items.length : Math.max(0, position);
+    this._items.splice(pos, 0, instance);
+    // 同步 _perItemDelays（新增项默认延迟 0）
+    if (this._perItemDelays) {
+      this._perItemDelays.splice(pos, 0, 0);
+    }
+    // 更新 _currentIndex：如果插入位置在当前索引之前，需要加 1
+    if (this._currentIndex >= pos) {
+      this._currentIndex++;
     }
     return this;
   }
@@ -3119,6 +3443,20 @@ class _AwdioManager {
     let temp = this._items[a];
     this._items[a] = this._items[b];
     this._items[b] = temp;
+    // 同步 _perItemDelays
+    if (this._perItemDelays) {
+      let tempDelay = this._perItemDelays[a];
+      this._perItemDelays[a] = this._perItemDelays[b] || 0;
+      this._perItemDelays[b] = tempDelay || 0;
+    }
+    // 更新 _currentIndex 和 _currentPlaying
+    if (this._currentIndex === a) {
+      this._currentIndex = b;
+      this._currentPlaying = this._items[b];
+    } else if (this._currentIndex === b) {
+      this._currentIndex = a;
+      this._currentPlaying = this._items[a];
+    }
     return this;
   }
 

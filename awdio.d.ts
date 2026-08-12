@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
  * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
- * @version 3.10.0
+ * @version 3.11.0
  */
 
 declare class Awdio {
@@ -748,6 +748,20 @@ interface AwdioOptions {
   pitch?: number;
   /** 是否倒放（默认 false） */
   reverse?: boolean;
+  /** 
+   * 是否使用 HTML5 AudioElement 播放（默认自动判断）
+   * 仅网络链接(http/https URL)有效，音波音乐/本地音乐/Data URI 忽略此参数始终为 false
+   * 设置为 true 可绕过 CORS 跨域限制，但无法使用 Web Audio 音效（reverb、filter 等）
+   * HTML5 模式下 clip 片段和 device 设备路由同样生效
+   * queue/playAll 中传入字符串 URL 会自动创建 html:true 的实例
+   */
+  html?: boolean;
+  /** 
+   * 切后台时是否暂停播放（默认 true）
+   * true: 切后台暂停，切回前台恢复
+   * false: 后台继续播放
+   */
+  pauseOnBack?: boolean;
   /** Attack 起音时间 秒（默认 0.01） */
   a?: number;
   /** Release 释音时间 秒（默认 0.3） */
