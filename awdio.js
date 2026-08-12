@@ -562,9 +562,17 @@ class Awdio {
     this._pitch = opts.pitch != null ? Math.max(0.1, Math.min(10, opts.pitch)) : 1;
     this._reverse = opts.reverse || false;
     this._pauseOnBack = opts.pauseOnBack !== undefined ? opts.pauseOnBack : true;
-    // 自动判断是否使用 HTML5 Audio：仅网络链接(src 是 http/https URL)有效，音波/本地音乐忽略 html 参数
+    // HTML5 Audio 判断：音波/Data URI 强制 false；网络 URL 默认 true；本地路径默认 false 但显式 html:true 有效
+    let _isSynth = !!(this._formula || this._type);
+    let _isDataUri = this._src && Awdio._isDataURI(this._src);
     let _isNetworkSrc = this._src && (Awdio._isURL(this._src) && !Awdio._isDataURI(this._src));
-    this._useHtmlAudio = _isNetworkSrc ? (opts.html !== undefined ? opts.html : true) : false;
+    if (_isSynth || _isDataUri) {
+      this._useHtmlAudio = false;
+    } else if (opts.html !== undefined) {
+      this._useHtmlAudio = !!opts.html;
+    } else {
+      this._useHtmlAudio = !!_isNetworkSrc;
+    }
     this._htmlAudio = null;
     this._a = opts.a != null ? Math.max(0, opts.a) : 0.01;
     this._r = opts.r != null ? Math.max(0, opts.r) : 0.3;
@@ -1658,9 +1666,16 @@ class Awdio {
         this._src = arg.src;
         this._formula = null;
         this._type = null;
-        // 仅网络链接启用 HTML5 Audio，其他忽略
-        let isNet = (Awdio._isURL(this._src) && !Awdio._isDataURI(this._src));
-        this._useHtmlAudio = isNet;
+        // 音波已清除，仅 data URI 强制 false；否则按显式 html 或自动判断
+        let isDataUri = Awdio._isDataURI(this._src);
+        let isNet = (Awdio._isURL(this._src) && !isDataUri);
+        if (isDataUri) {
+          this._useHtmlAudio = false;
+        } else if (arg.html !== undefined) {
+          this._useHtmlAudio = !!arg.html;
+        } else {
+          this._useHtmlAudio = !!isNet;
+        }
         if (this._useHtmlAudio) {
           if (this._htmlAudio) { this._htmlAudio.remove(); this._htmlAudio = null; }
           this._createHtmlAudio();
@@ -1729,9 +1744,12 @@ class Awdio {
         this.device(arg.device);
       }
       if (arg.html !== undefined) {
-        // 仅网络链接支持 html 模式，音波/本地音乐忽略
-        let isNet = this._src && (Awdio._isURL(this._src) && !Awdio._isDataURI(this._src));
-        this._useHtmlAudio = isNet ? !!arg.html : false;
+        // 音波音乐强制忽略；其他情况尊重显式设置
+        if (this._formula || this._type) {
+          this._useHtmlAudio = false;
+        } else {
+          this._useHtmlAudio = !!arg.html;
+        }
         if (this._useHtmlAudio && this._src && !this._htmlAudio) {
           this._createHtmlAudio();
         }
@@ -1771,9 +1789,10 @@ class Awdio {
         this._src = arg;
         this._formula = null;
         this._type = null;
-        // 仅网络链接启用 HTML5 Audio，data URI 用 Web Audio
-        let isNet = (Awdio._isURL(arg) && !Awdio._isDataURI(arg));
-        this._useHtmlAudio = isNet;
+        // data URI 强制 false；网络 URL 默认 true
+        let isDataUri = Awdio._isDataURI(arg);
+        let isNet = (Awdio._isURL(arg) && !isDataUri);
+        this._useHtmlAudio = isDataUri ? false : !!isNet;
         if (this._useHtmlAudio) {
           if (this._htmlAudio) { this._htmlAudio.remove(); this._htmlAudio = null; }
           this._createHtmlAudio();
@@ -1932,9 +1951,10 @@ class Awdio {
 
   set src(val) {
     this._src = val;
-    // 仅网络链接启用 HTML5 Audio，音波/本地音乐忽略
-    let isNetwork = (Awdio._isURL(val) && !Awdio._isDataURI(val));
-    this._useHtmlAudio = isNetwork;
+    // data URI 强制 false；网络 URL 默认 true；本地路径默认 false
+    let isDataUri = Awdio._isDataURI(val);
+    let isNet = (Awdio._isURL(val) && !isDataUri);
+    this._useHtmlAudio = isDataUri ? false : !!isNet;
     if (this._useHtmlAudio) {
       if (this._htmlAudio) {
         this._htmlAudio.remove();
