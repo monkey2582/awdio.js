@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
- * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
- * @version 3.11.0
+ * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、麦克风、队列播放、链式调用等
+ * @version 3.14.0
  */
 !(function(root,factory){
   if (typeof define === 'function' && define.amd) {
@@ -33,6 +33,11 @@ class Awdio {
   /** 活跃的 queue/playAll 管理器 */
   static _managers = new Set();
 
+  /** 全局音频缓存：URL → 已解码 AudioBuffer（可用 Awdio.clearCache() 清空） */
+  static _audioCache = new Map();
+  /** 是否启用全局缓存（默认 true；实例可用 opts.cache:false 单独关闭） */
+  static _cacheEnabled = true;
+
   /** 已知波形类型列表 */
   static _waveTypes = [
     // 基础波形
@@ -51,7 +56,9 @@ class Awdio {
     // 模拟合成器
     'synth_bass', 'synth_lead', 'synth_pad', 'supersaw', 'sub_bass',
     // 效果音
-    'laser', 'sweep', 'bubble', 'click'
+    'laser', 'sweep', 'bubble', 'click',
+    // 麦克风实时音频
+    'mic'
   ];
 
   // ==================== 静态方法 ====================
@@ -59,8 +66,42 @@ class Awdio {
   static getContext() {
     if (!Awdio._ctx) {
       Awdio._ctx = new (window.AudioContext || window.webkitAudioContext)();
+      // 自动播放策略解锁：浏览器要求用户手势后才能 resume
+      // 首次创建后自动监听用户手势，自动恢复 AudioContext
+      if (typeof document !== 'undefined' && document.addEventListener) {
+        let unlock = () => {
+          if (Awdio._ctx && Awdio._ctx.state === 'suspended') {
+            Awdio._ctx.resume().catch(() => {});
+          }
+        };
+        ['click', 'touchstart', 'touchend'].forEach(evt => {
+          document.addEventListener(evt, unlock, { once: true, capture: true });
+        });
+      }
     }
     return Awdio._ctx;
+  }
+
+  /**
+   * 手动解锁 AudioContext（自动播放策略）
+   * 通常在用户手势（点击/触摸）回调中调用；getContext 已自动注册全局解锁，一般无需手动调用
+   * @returns {Awdio}
+   */
+  static unlock() {
+    if (!Awdio._ctx) return Awdio;
+    if (Awdio._ctx.state === 'suspended') {
+      Awdio._ctx.resume().catch(() => {});
+    }
+    return Awdio;
+  }
+
+  /**
+   * 清空全局音频缓存（已解码的 AudioBuffer）
+   * @returns {Awdio}
+   */
+  static clearCache() {
+    if (Awdio._audioCache) Awdio._audioCache.clear();
+    return Awdio;
   }
 
   static getGlobalGainNode() {
@@ -317,6 +358,17 @@ class Awdio {
     return /^data:/.test(str);
   }
 
+  /**
+   * 判断是否应使用 HTML5 AudioElement 播放
+   * @param {string|null} src - 音频源
+   * @param {boolean} [explicitHtml] - 显式 html 选项；data URI 始终强制 WebAudio
+   */
+  static _detectHtmlMode(src, explicitHtml) {
+    if (Awdio._isDataURI(src)) return false;
+    if (explicitHtml !== undefined) return !!explicitHtml;
+    return !!(Awdio._isURL(src) && !Awdio._isDataURI(src));
+  }
+
   static _isWaveType(str) {
     return Awdio._waveTypes.includes(str) || Awdio._formulas.has(str);
   }
@@ -330,6 +382,20 @@ class Awdio {
       if (parts.length === 3) return Math.max(0, parts[0] * 3600 + parts[1] * 60 + parts[2]);
     }
     return 0;
+  }
+
+  /**
+   * 创建实例并加载本地音频文件
+   * @param {File|Blob|ArrayBuffer|ArrayBufferView|string} file - 本地音频文件对象 / ArrayBuffer / 音频 URL 或路径
+   * @param {object} [opts] - 实例选项（如 { autoplay: true, volume: 80 }）
+   * @returns {Awdio} 新的 Awdio 实例
+   *
+   * 示例：let a = Awdio.load(fileInput.files[0], { autoplay: true })
+   *       let b = Awdio.load('music.mp3').play()
+   */
+  static load(file, opts) {
+    let inst = new Awdio(opts || {});
+    return inst.load(file);
   }
 
   static _resolve(item) {
@@ -347,22 +413,33 @@ class Awdio {
   }
 
   /**
-   * 解析混合参数列表（实例 + 延迟数字）
-   * 返回 [{ item, delayAfter }] 和全局 opts
+   * 统一解析 queue/playAll 参数
+   * 支持数组形式 [a, 200, b, opts] 与扁平形式 (a, 200, b, opts)
+   * 数字跟在 item 后表示该 item 的逐项延迟，叠加到全局 delay
+   * @returns {{ entries: Array<{item: Awdio|null, delayAfter: number}>, opts: object }}
    */
-  static _parseQueueArgs(args) {
+  static _buildQueueEntries(args) {
     let opts = {};
-    let raw = [...args];
+    let raw;
 
-    // 末尾是选项对象则提取
-    let last = raw[raw.length - 1];
-    if (last && typeof last === 'object' && !Array.isArray(last) && !(last instanceof Awdio) && typeof last !== 'function') {
-      let hasQueueOpts = ['loop', 'delay', 'fade', 'fadeIn', 'fadeOut', 'fadeDuration', 'fadeInDuration', 'fadeOutDuration', 'autoplay', 'pauseOnBack'].some(k => k in last);
-      if (hasQueueOpts) {
-        opts = raw.pop();
+    if (Array.isArray(args[0])) {
+      raw = args[0];
+      if (args[1] && typeof args[1] === 'object' && !Array.isArray(args[1])) {
+        opts = args[1];
+      }
+    } else {
+      raw = [...args];
+      // 末尾是选项对象则提取（仅当含队列选项键，避免误吞实例选项对象）
+      let last = raw[raw.length - 1];
+      if (last && typeof last === 'object' && !Array.isArray(last) && !(last instanceof Awdio) && typeof last !== 'function') {
+        let hasQueueOpts = ['loop', 'delay', 'fade', 'fadeIn', 'fadeOut', 'fadeDuration', 'fadeInDuration', 'fadeOutDuration', 'autoplay', 'pauseOnBack'].some(k => k in last);
+        if (hasQueueOpts) {
+          opts = raw.pop();
+        }
       }
     }
 
+    let globalDelay = opts.delay || 0;
     let entries = [];
     let pendingDelay = 0;
 
@@ -372,100 +449,30 @@ class Awdio {
       } else {
         let inst = Awdio._resolve(val);
         if (inst) {
-          entries.push({ item: inst, delayAfter: pendingDelay });
+          entries.push({ item: inst, delayAfter: pendingDelay + globalDelay });
           pendingDelay = 0;
         }
       }
     }
-
     // 剩余数字作为末尾延迟
     if (pendingDelay > 0) {
-      entries.push({ item: null, delayAfter: pendingDelay });
+      entries.push({ item: null, delayAfter: pendingDelay + globalDelay });
     }
 
     return { entries, opts };
   }
 
   static queue(...args) {
-    let entries, opts = {};
-
-    if (Array.isArray(args[0])) {
-      // 数组形式：支持逐项数字延迟 [aw1, 200, aw2, 100, aw3]
-      // 数字跟在 item 后面表示该 item 的逐项延迟，叠加到全局 delay
-      let raw = args[0];
-      if (args[1] && typeof args[1] === 'object' && !Array.isArray(args[1])) {
-        opts = args[1];
-      }
-
-      let globalDelay = opts.delay || 0;
-      entries = [];
-      let pendingDelay = 0;
-
-      for (let val of raw) {
-        if (typeof val === 'number') {
-          pendingDelay += val;
-        } else {
-          let inst = Awdio._resolve(val);
-          if (inst) {
-            entries.push({ item: inst, delayAfter: pendingDelay + globalDelay });
-            pendingDelay = 0;
-          }
-        }
-      }
-      // 末尾数字
-      if (pendingDelay > 0) {
-        entries.push({ item: null, delayAfter: pendingDelay + globalDelay });
-      }
-    } else {
-      // 扁平形式：awdio.queue(100, aw1, 200, aw2, 300)
-      let parsed = Awdio._parseQueueArgs(args);
-      entries = parsed.entries;
-      opts = parsed.opts;
-    }
-
-    let instances = entries.filter(e => e.item).map(e => e.item);
-    let mgr = new _AwdioManager(instances, opts, 'sequential');
+    let { entries, opts } = Awdio._buildQueueEntries(args);
+    let mgr = new _AwdioManager(entries.filter(e => e.item).map(e => e.item), opts, 'sequential');
     Awdio._managers.add(mgr);
-    // 注入逐项延迟
     mgr._perItemDelays = entries.map(e => e.delayAfter);
     return mgr;
   }
 
   static playAll(...args) {
-    let entries, opts = {};
-
-    if (Array.isArray(args[0])) {
-      let raw = args[0];
-      if (args[1] && typeof args[1] === 'object' && !Array.isArray(args[1])) {
-        opts = args[1];
-      }
-
-      let globalDelay = opts.delay || 0;
-      entries = [];
-      let pendingDelay = 0;
-
-      for (let val of raw) {
-        if (typeof val === 'number') {
-          pendingDelay += val;
-        } else {
-          let inst = Awdio._resolve(val);
-          if (inst) {
-            entries.push({ item: inst, delayAfter: pendingDelay + globalDelay });
-            pendingDelay = 0;
-          }
-        }
-      }
-      if (pendingDelay > 0) {
-        entries.push({ item: null, delayAfter: pendingDelay + globalDelay });
-      }
-    } else {
-      let parsed = Awdio._parseQueueArgs(args);
-      entries = parsed.entries;
-      opts = parsed.opts;
-    }
-
-    let instances = entries.filter(e => e.item).map(e => e.item);
-    let mgr = new _AwdioManager(instances, opts, 'parallel');
+    let { entries, opts } = Awdio._buildQueueEntries(args);
+    let mgr = new _AwdioManager(entries.filter(e => e.item).map(e => e.item), opts, 'parallel');
     Awdio._managers.add(mgr);
     mgr._perItemDelays = entries.map(e => e.delayAfter);
     return mgr;
@@ -509,6 +516,7 @@ class Awdio {
     this._phaserDry = null;
     this._phaserWet = null;
     this._phaserLFOs = null;
+    this._phaserFilters = null;   // 移相 allpass 链（rebuild 时重建）
     this._stereoPanner = null;
     this._pannerNode = null;
     this._analyserNode = null;     // FFT 频谱分析
@@ -562,18 +570,34 @@ class Awdio {
     this._pitch = opts.pitch != null ? Math.max(0.1, Math.min(10, opts.pitch)) : 1;
     this._reverse = opts.reverse || false;
     this._pauseOnBack = opts.pauseOnBack !== undefined ? opts.pauseOnBack : true;
-    // HTML5 Audio 判断：音波/Data URI 强制 false；网络 URL 默认 true；本地路径默认 false 但显式 html:true 有效
+    this._cache = opts.cache !== undefined ? !!opts.cache : true; // 是否参与全局音频缓存
+    // HTML5 Audio 判断：合成音波强制 false；其余按 _detectHtmlMode（data URI 强制 false，网络 URL 默认 true）
     let _isSynth = !!(this._formula || this._type);
-    let _isDataUri = this._src && Awdio._isDataURI(this._src);
-    let _isNetworkSrc = this._src && (Awdio._isURL(this._src) && !Awdio._isDataURI(this._src));
-    if (_isSynth || _isDataUri) {
-      this._useHtmlAudio = false;
-    } else if (opts.html !== undefined) {
-      this._useHtmlAudio = !!opts.html;
-    } else {
-      this._useHtmlAudio = !!_isNetworkSrc;
-    }
+    this._useHtmlAudio = _isSynth ? false : Awdio._detectHtmlMode(this._src, opts.html);
     this._htmlAudio = null;
+    // 麦克风模式：type:'mic' 或 opts.mic 为 true / 配置对象
+    this._micOpts = (opts.mic && typeof opts.mic === 'object') ? opts.mic : null;
+    this._isMic = (this._type === 'mic') || (opts.mic === true) || !!this._micOpts;
+    if (this._isMic && this._type !== 'mic') this._type = 'mic';
+    this._micStream = null;       // MediaStream
+    this._micSource = null;       // MediaStreamAudioSourceNode
+    this._micReady = false;       // 麦克风流是否就绪
+    this._micConnected = false;   // 是否已接入音频链
+    this._micPlayRequested = false; // 就绪前调用 play() 的挂起标记
+    this._micStartedAt = 0;
+    this._objectUrl = null;       // load(file) 创建的 object URL（销毁时回收）
+    this._playRequested = false;  // 音频加载完成前调用 play() 的挂起标记
+    this._loadToken = 0;          // 加载令牌：连续 load 时只认最新一次
+    this._detune = opts.detune || 0; // 微调音高（音分 cents）
+    this._fadeOutTimer = null;    // 淡出定时器（防止与 play() 竞态）
+    this._fadeOutInterval = null; // HTML5 淡出 interval
+    // 延迟效果器节点
+    this._delayNode = null;       // DelayNode
+    this._delayDry = null;        // 干声增益
+    this._delayWet = null;        // 湿声增益
+    this._delayMix = null;        // 干湿混合节点（串联进链）
+    this._delayFeedback = null;   // 反馈增益
+    this._delayFilter = null;     // 反馈低通（可选）
     this._a = opts.a != null ? Math.max(0, opts.a) : 0.01;
     this._r = opts.r != null ? Math.max(0, opts.r) : 0.3;
     this._params = {}; // 通用参数存储
@@ -612,8 +636,15 @@ class Awdio {
     // 应用音量
     this._applyVolume();
 
-    // 加载或合成：优先级 src > formula > type
-    if (this._src) {
+    // 初始化立体声平衡（opts.pan，-1~1）
+    if (opts.pan != null) {
+      this.param('pan', opts.pan);
+    }
+
+    // 加载或合成：mic > src > formula > type
+    if (this._isMic) {
+      this._setupMic();
+    } else if (this._src) {
       if (this._useHtmlAudio) {
         this._createHtmlAudio();
         if (this._autoplay) this._play();
@@ -640,6 +671,10 @@ class Awdio {
     if (this._filterNode) this._filterNode.disconnect();
     if (this._compNode) this._compNode.disconnect();
     if (this._compGainNode) this._compGainNode.disconnect();
+    if (this._delayNode) this._delayNode.disconnect();
+    if (this._delayDry) this._delayDry.disconnect();
+    if (this._delayWet) this._delayWet.disconnect();
+    if (this._delayMix) this._delayMix.disconnect();
     if (this._reverbDry) this._reverbDry.disconnect();
     if (this._reverbWet) this._reverbWet.disconnect();
     if (this._reverbNode) this._reverbNode.disconnect();
@@ -680,6 +715,44 @@ class Awdio {
       prev = this._compGainNode;
     }
 
+    // 延迟效果（干湿混合后继续串联给后续效果）
+    if (prev && this._delayNode && this._delayDry && this._delayWet && this._delayMix) {
+      prev.connect(this._delayDry);
+      prev.connect(this._delayNode);
+      // 重建内部反馈环与湿声链（rebuild 会断开所有连接）
+      this._delayNode.connect(this._delayFeedback);
+      this._delayFeedback.connect(this._delayNode);
+      if (this._delayFilter) {
+        this._delayNode.connect(this._delayFilter);
+        this._delayFilter.connect(this._delayWet);
+      } else {
+        this._delayNode.connect(this._delayWet);
+      }
+      this._delayDry.connect(this._delayMix);
+      this._delayWet.connect(this._delayMix);
+      prev = this._delayMix;
+    }
+
+    // 移相效果：重建 allpass 链（rebuild 会断开 phaserWet 的输出）
+    if (prev && this._phaserNode && this._phaserDry && this._phaserWet && this._phaserFilters && this._phaserFilters.length > 0) {
+      prev.connect(this._phaserDry);
+      prev.connect(this._phaserWet);
+      let apPrev = this._phaserWet;
+      for (let apf of this._phaserFilters) {
+        apPrev.connect(apf);
+        apPrev = apf;
+      }
+      apPrev.connect(this._phaserNode);
+      this._phaserDry.connect(this._phaserNode);
+      prev = this._phaserNode;
+    } else if (prev && this._phaserNode && this._phaserDry && this._phaserWet) {
+      prev.connect(this._phaserDry);
+      prev.connect(this._phaserWet);
+      this._phaserDry.connect(this._phaserNode);
+      this._phaserWet.connect(this._phaserNode);
+      prev = this._phaserNode;
+    }
+
     if (this._reverbDry && this._reverbWet && this._reverbNode) {
       prev.connect(this._reverbDry);
       prev.connect(this._reverbNode);
@@ -696,15 +769,6 @@ class Awdio {
       this._chorusDry.connect(this._chorusNode);
       this._chorusWet.connect(this._chorusNode);
       prev = this._chorusNode;
-    }
-
-    // 移相效果
-    if (prev && this._phaserNode && this._phaserDry && this._phaserWet) {
-      prev.connect(this._phaserDry);
-      prev.connect(this._phaserWet);
-      this._phaserDry.connect(this._phaserNode);
-      this._phaserWet.connect(this._phaserNode);
-      prev = this._phaserNode;
     }
 
     // 3D 空间定位
@@ -1004,9 +1068,162 @@ class Awdio {
 
   // ==================== 加载音频 ====================
 
+  /**
+   * 加载本地音频文件（File / Blob / ArrayBuffer / URL 字符串）
+   * @param {File|Blob|ArrayBuffer|ArrayBufferView|string} file - 本地音频文件对象、二进制数据或音频 URL/路径
+   * @param {object} [opts] - 可选：{ autoplay: true } 加载完成后自动播放
+   * @returns {this}
+   *
+   * 示例：awdio.load(fileInput.files[0])           // 加载本地文件
+   *       awdio.load(file, { autoplay: true })     // 加载并播放
+   *       Awdio.load(file).play()                  // 静态方式创建并加载
+   */
+  load(file, opts) {
+    if (this._destroyed || !file) return this;
+    if (opts && typeof opts === 'object') {
+      if (opts.autoplay !== undefined) this._autoplay = !!opts.autoplay;
+    }
+
+    // 清理旧源（麦克风 / object URL / HTML5 Audio / buffer）
+    this._cleanupSource();
+
+    if (typeof file === 'string') {
+      // URL / 路径 / data URI
+      this._formula = null;
+      this._type = null;
+      this._src = file;
+      this._useHtmlAudio = Awdio._detectHtmlMode(file);
+      if (this._useHtmlAudio) {
+        this._createHtmlAudio();
+      } else {
+        this._load();
+      }
+      return this;
+    }
+
+    if (file instanceof Blob || (typeof File !== 'undefined' && file instanceof File)) {
+      // File/Blob → object URL → fetch 解码
+      this._formula = null;
+      this._type = null;
+      this._src = URL.createObjectURL(file);
+      this._objectUrl = this._src;
+      this._useHtmlAudio = false;
+      this._load();
+      return this;
+    }
+
+    // ArrayBuffer / TypedArray / DataView → 直接解码
+    let buf = file.buffer ? file.buffer : file;
+    if (buf instanceof ArrayBuffer) {
+      this._formula = null;
+      this._type = null;
+      this._src = null;
+      this._isLoading = true;
+      let token = ++this._loadToken;
+      this._ctx.decodeAudioData(buf.slice(0)).then(decoded => {
+        if (token !== this._loadToken) return;
+        this._buffer = decoded;
+        this._isLoading = false;
+        this._emit('load', { src: null });
+        if (this._playRequested || this._autoplay) {
+          this._playRequested = false;
+          this._play();
+        }
+      }).catch(e => {
+        if (token !== this._loadToken) return;
+        this._isLoading = false;
+        console.error('Awdio: 解码音频失败', e);
+        this._emit('error', { error: e, src: null });
+      });
+      return this;
+    }
+
+    console.warn('Awdio: load() 不支持的参数类型', file);
+    return this;
+  }
+
+  /**
+   * 初始化麦克风（type:'mic' 或 opts.mic:true）
+   * 内部使用：请求权限 → 创建 MediaStreamSource → 触发 'micready' 事件
+   */
+  async _setupMic() {
+    if (this._micStream || this._destroyed) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      this._emit('error', { error: new Error('当前环境不支持麦克风（需要 HTTPS 或 localhost）'), type: 'mic' });
+      return;
+    }
+    try {
+      this._micStream = await navigator.mediaDevices.getUserMedia({ audio: this._micOpts || true });
+      this._micSource = this._ctx.createMediaStreamSource(this._micStream);
+      this._micReady = true;
+      this._emit('micready', { stream: this._micStream });
+      if (this._micPlayRequested || this._autoplay) {
+        this._micPlayRequested = false;
+        this._play();
+      }
+    } catch (e) {
+      this._emit('error', { error: e, type: 'mic' });
+    }
+  }
+
+  /**
+   * 停止并释放麦克风资源（内部使用）
+   */
+  _teardownMic() {
+    if (this._micConnected) {
+      try { this._micSource.disconnect(); } catch (e) {}
+      this._micConnected = false;
+    }
+    if (this._micStream) {
+      this._micStream.getTracks().forEach(t => t.stop());
+      this._micStream = null;
+      this._micSource = null;
+    }
+    this._micReady = false;
+    this._micPlayRequested = false;
+  }
+
+  /**
+   * 清理当前音频源的所有资源（切源前调用）
+   * 停止麦克风、回收 object URL、销毁 HTML5 Audio、清空解码 buffer 与暂停位置
+   */
+  _cleanupSource() {
+    if (this._isMic) {
+      this._teardownMic();
+      this._isMic = false;
+      this._micOpts = null;
+    }
+    if (this._objectUrl) {
+      try { URL.revokeObjectURL(this._objectUrl); } catch (e) {}
+      this._objectUrl = null;
+    }
+    if (this._htmlAudio) {
+      this._htmlAudio.pause();
+      this._htmlAudio.src = '';
+      this._htmlAudio.remove();
+      this._htmlAudio = null;
+      if (Awdio._htmlAudioInstances) Awdio._htmlAudioInstances.delete(this);
+    }
+    this._buffer = null;
+    this._pausedAt = 0;
+    this._playRequested = false;
+  }
+
   async _load() {
-    if (this._isLoading) return;
+    // 令牌机制：连续 load() 时只认最新一次（旧请求结果作废）
+    let token = ++this._loadToken;
     this._isLoading = true;
+
+    // 全局音频缓存命中（blob: URL 不缓存，避免 object URL 泄漏）
+    let useCache = Awdio._cacheEnabled && this._cache !== false && !this._objectUrl;
+    if (useCache && this._src && Awdio._audioCache.has(this._src)) {
+      this._buffer = Awdio._audioCache.get(this._src);
+      this._isLoading = false;
+      this._emit('load', { src: this._src, cached: true });
+      this._afterLoad(token);
+      return;
+    }
+
     try {
       let buf;
       if (Awdio._isDataURI(this._src)) {
@@ -1031,20 +1248,26 @@ class Awdio {
       } else {
         let resp = await fetch(this._src);
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        // 流式读取 + 进度回调
+        // 流式读取 + 进度回调（旧浏览器无 ReadableStream 时降级 arrayBuffer）
         let contentLength = resp.headers.get('content-length');
         let total = contentLength ? parseInt(contentLength, 10) : 0;
-        let reader = resp.body.getReader();
         let chunks = [];
         let loaded = 0;
-        while (true) {
-          let { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-          loaded += value.length;
-          if (total > 0) {
-            this._emit('progress', { loaded, total, percent: Math.round(loaded / total * 100) });
+        if (resp.body && resp.body.getReader) {
+          let reader = resp.body.getReader();
+          while (true) {
+            let { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            loaded += value.length;
+            if (total > 0) {
+              this._emit('progress', { loaded, total, percent: Math.round(loaded / total * 100) });
+            }
           }
+        } else {
+          let arr = await resp.arrayBuffer();
+          loaded = arr.byteLength;
+          chunks.push(new Uint8Array(arr));
         }
         // 合并 chunks
         buf = new ArrayBuffer(loaded);
@@ -1055,14 +1278,37 @@ class Awdio {
           pos += chunk.length;
         }
       }
-      this._buffer = await this._ctx.decodeAudioData(buf);
+
+      // 已被更新的 load() 取代：丢弃本次结果
+      if (token !== this._loadToken) return;
+
+      let decoded = await this._ctx.decodeAudioData(buf);
+      // decode 期间又发起了新 load：丢弃
+      if (token !== this._loadToken) return;
+
+      this._buffer = decoded;
+      if (useCache && this._src && !this._objectUrl) {
+        Awdio._audioCache.set(this._src, decoded);
+      }
       this._isLoading = false;
-      this._emit('load', { src: this._src });
-      if (this._autoplay) this._play();
+      this._emit('load', { src: this._src, cached: false });
+      this._afterLoad(token);
     } catch (e) {
+      if (token !== this._loadToken) return;
       this._isLoading = false;
       console.error('Awdio: 加载音频失败', e);
       this._emit('error', { error: e, src: this._src });
+    }
+  }
+
+  /**
+   * 加载完成后的收尾：触发挂起的 play() / autoplay
+   */
+  _afterLoad(token) {
+    if (token !== this._loadToken) return;
+    if (this._playRequested || this._autoplay) {
+      this._playRequested = false;
+      this._play();
     }
   }
 
@@ -1353,6 +1599,22 @@ class Awdio {
   _play() {
     if (this._destroyed) return;
 
+    // 取消未完成的淡出，避免淡出定时器随后 stop() 杀掉本次播放
+    if (this._fadeOutTimer) {
+      clearTimeout(this._fadeOutTimer);
+      this._fadeOutTimer = null;
+    }
+    if (this._fadeOutInterval) {
+      clearInterval(this._fadeOutInterval);
+      this._fadeOutInterval = null;
+    }
+    // 取消淡出增益调度，恢复实际音量
+    if (this._gainNode) {
+      try {
+        this._gainNode.gain.cancelScheduledValues(this._ctx.currentTime);
+      } catch (e) {}
+    }
+
     // HTML5 音频模式
     if (this._useHtmlAudio) {
       if (!this._htmlAudio) this._createHtmlAudio();
@@ -1393,7 +1655,33 @@ class Awdio {
       return;
     }
 
+    // 麦克风实时音频（type:'mic'）
+    if (this._isMic) {
+      if (this._ctx.state === 'suspended') {
+        this._ctx.resume();
+      }
+      if (!this._micReady) {
+        // 流未就绪：挂起播放请求，等 'micready' 后自动连接
+        this._micPlayRequested = true;
+        this._setupMic();
+        return;
+      }
+      this._ensureChainConnected();
+      if (!this._micConnected) {
+        try { this._micSource.connect(this._chainInput); } catch (e) {}
+        this._micConnected = true;
+        this._micStartedAt = this._ctx.currentTime;
+      }
+      this._emit('play', { source: this._micSource });
+      return;
+    }
+
     if (!this._buffer) {
+      // 正在加载或有 src 但未就绪：挂起播放请求，加载完成后自动播放
+      if (this._isLoading || (this._src && !this._buffer)) {
+        this._playRequested = true;
+        return;
+      }
       console.warn('Awdio: 音频尚未就绪');
       return;
     }
@@ -1412,6 +1700,7 @@ class Awdio {
     source.buffer = this._reverse ? this._getReversedBuffer() : this._buffer;
     source.loop = this._loop;
     source.playbackRate.value = this._speed * this._pitch;
+    if (source.detune) source.detune.value = this._detune;
     source.connect(this._chainInput);
 
     let now = this._ctx.currentTime;
@@ -1487,6 +1776,15 @@ class Awdio {
       return;
     }
 
+    // 麦克风模式：断开麦克风与音频链的连接（不停止采集，可恢复）
+    if (this._isMic) {
+      if (this._micConnected) {
+        try { this._micSource.disconnect(); } catch (e) {}
+        this._micConnected = false;
+      }
+      return;
+    }
+
     // 淡出暂停
     if (this._fadeOut && this._activeSources.length > 0) {
       let now = this._ctx.currentTime;
@@ -1528,6 +1826,15 @@ class Awdio {
     if (this._useHtmlAudio && this._htmlAudio) {
       this._htmlAudio.pause();
       this._htmlAudio.currentTime = 0;
+      return;
+    }
+
+    // 麦克风模式：仅断开连接（保留流，供再次 play()）
+    if (this._isMic) {
+      if (this._micConnected) {
+        try { this._micSource.disconnect(); } catch (e) {}
+        this._micConnected = false;
+      }
       return;
     }
 
@@ -1601,7 +1908,15 @@ class Awdio {
       this._handleArg(arg);
     }
 
+    this._playRequested = false;
+    this._micPlayRequested = false;
+    if (this._fadeOutTimer) { clearTimeout(this._fadeOutTimer); this._fadeOutTimer = null; }
+    if (this._fadeOutInterval) { clearInterval(this._fadeOutInterval); this._fadeOutInterval = null; }
     this._stopAllSources();
+    // 麦克风模式：stop() 完全停止并释放麦克风采集
+    if (this._isMic) {
+      this._teardownMic();
+    }
     this._pausedAt = 0;
     this._emit('stop');
     // 停止后断开全局输出，释放音频图资源
@@ -1662,28 +1977,20 @@ class Awdio {
       let hasType = arg.type !== undefined;
 
       if (hasSrc) {
-        // src 最高优先级：清除 formula 和 type
+        // src 最高优先级：清除 formula / type / mic / 旧源
+        this._cleanupSource();
         this._src = arg.src;
         this._formula = null;
         this._type = null;
-        // 音波已清除，仅 data URI 强制 false；否则按显式 html 或自动判断
-        let isDataUri = Awdio._isDataURI(this._src);
-        let isNet = (Awdio._isURL(this._src) && !isDataUri);
-        if (isDataUri) {
-          this._useHtmlAudio = false;
-        } else if (arg.html !== undefined) {
-          this._useHtmlAudio = !!arg.html;
-        } else {
-          this._useHtmlAudio = !!isNet;
-        }
+        this._useHtmlAudio = Awdio._detectHtmlMode(this._src, arg.html);
         if (this._useHtmlAudio) {
-          if (this._htmlAudio) { this._htmlAudio.remove(); this._htmlAudio = null; }
           this._createHtmlAudio();
         } else {
           this._load();
         }
       } else if (hasFormula) {
         // formula 第二优先级
+        this._cleanupSource();
         this._formula = arg.formula;
         this._type = arg.formula;
         this._src = null;
@@ -1691,23 +1998,43 @@ class Awdio {
         this._buffer = this._createBuffer(arg.formula, this._freq);
       } else if (hasType) {
         // type 第三优先级
+        this._cleanupSource();
         this._type = arg.type;
         this._src = null;
         this._useHtmlAudio = false;
-        if (typeof arg.type === 'function') {
+        if (arg.type === 'mic') {
+          // 麦克风模式
+          this._isMic = true;
+          this._micOpts = (arg.mic && typeof arg.mic === 'object') ? arg.mic : null;
+          this._formula = null;
+          this._setupMic();
+        } else if (typeof arg.type === 'function') {
           this._formula = arg.type;
+          this._buffer = this._createBuffer(arg.type, this._freq);
         } else if (Awdio._formulas.has(arg.type)) {
           this._formula = Awdio._formulas.get(arg.type);
+          this._buffer = this._createBuffer(arg.type, this._freq);
         } else {
           this._formula = null;
+          this._buffer = this._createBuffer(arg.type, this._freq);
         }
-        this._buffer = this._createBuffer(arg.type, this._freq);
+      }
+      // 仅 mic 选项（无 type/src/formula）：直接切换到麦克风模式
+      if (arg.mic !== undefined && !hasSrc && !hasFormula && !hasType) {
+        this._cleanupSource();
+        this._isMic = true;
+        this._type = 'mic';
+        this._src = null;
+        this._formula = null;
+        this._useHtmlAudio = false;
+        this._micOpts = (typeof arg.mic === 'object') ? arg.mic : null;
+        this._setupMic();
       }
       if (arg.freq !== undefined) this._freq = arg.freq;
       if (arg.duration !== undefined) {
         this._duration = arg.duration;
-        // 如果当前是合成音频（非 src 加载），重新生成 buffer
-        if (!this._src && (this._formula || this._type)) {
+        // 如果当前是合成音频（非 src 加载、非麦克风），重新生成 buffer
+        if (!this._src && !this._isMic && (this._formula || this._type)) {
           this._buffer = this._createBuffer(this._formula || this._type, this._freq);
         }
       }
@@ -1744,11 +2071,11 @@ class Awdio {
         this.device(arg.device);
       }
       if (arg.html !== undefined) {
-        // 音波音乐强制忽略；其他情况尊重显式设置
+        // 音波音乐强制忽略；其他情况尊重显式设置（data URI 同样强制 WebAudio）
         if (this._formula || this._type) {
           this._useHtmlAudio = false;
         } else {
-          this._useHtmlAudio = !!arg.html;
+          this._useHtmlAudio = Awdio._detectHtmlMode(this._src, arg.html);
         }
         if (this._useHtmlAudio && this._src && !this._htmlAudio) {
           this._createHtmlAudio();
@@ -1774,32 +2101,41 @@ class Awdio {
    */
   _handleArg(arg) {
     if (typeof arg === 'function') {
+      this._cleanupSource();
       this._formula = arg;
       this._type = arg;
       this._src = null;
       this._useHtmlAudio = false;
       this._buffer = this._createBuffer(arg, this._freq);
     } else if (typeof arg === 'string') {
-      if (Awdio._isWaveType(arg)) {
+      if (arg === 'mic') {
+        // 麦克风实时音频
+        this._cleanupSource();
+        this._isMic = true;
+        this._type = 'mic';
+        this._formula = null;
+        this._src = null;
+        this._useHtmlAudio = false;
+        this._setupMic();
+      } else if (Awdio._isWaveType(arg)) {
+        this._cleanupSource();
         this._type = arg;
         this._formula = Awdio._formulas.get(arg) || null;
         this._useHtmlAudio = false;
         this._buffer = this._createBuffer(arg, this._freq);
       } else if (Awdio._isURL(arg) || Awdio._isDataURI(arg)) {
+        this._cleanupSource();
         this._src = arg;
         this._formula = null;
         this._type = null;
-        // data URI 强制 false；网络 URL 默认 true
-        let isDataUri = Awdio._isDataURI(arg);
-        let isNet = (Awdio._isURL(arg) && !isDataUri);
-        this._useHtmlAudio = isDataUri ? false : !!isNet;
+        this._useHtmlAudio = Awdio._detectHtmlMode(arg);
         if (this._useHtmlAudio) {
-          if (this._htmlAudio) { this._htmlAudio.remove(); this._htmlAudio = null; }
           this._createHtmlAudio();
         } else {
           this._load();
         }
       } else {
+        this._cleanupSource();
         this._src = arg;
         this._formula = null;
         this._type = null;
@@ -1932,6 +2268,7 @@ class Awdio {
       _speed: this._speed,
       speed: this._speed,
       pitch: this._pitch,
+      detune: this._detune,
       reverse: this._reverse,
       a: this._a,
       r: this._r,
@@ -1939,6 +2276,7 @@ class Awdio {
       params: { ...this._params },
       html: this._useHtmlAudio,
       pauseOnBack: this._pauseOnBack,
+      mic: this._isMic ? (this._micOpts || true) : false,
       destroyed: this._destroyed
     };
   }
@@ -1951,15 +2289,9 @@ class Awdio {
 
   set src(val) {
     this._src = val;
-    // data URI 强制 false；网络 URL 默认 true；本地路径默认 false
-    let isDataUri = Awdio._isDataURI(val);
-    let isNet = (Awdio._isURL(val) && !isDataUri);
-    this._useHtmlAudio = isDataUri ? false : !!isNet;
+    this._useHtmlAudio = Awdio._detectHtmlMode(val);
     if (this._useHtmlAudio) {
-      if (this._htmlAudio) {
-        this._htmlAudio.remove();
-        this._htmlAudio = null;
-      }
+      if (this._htmlAudio) { this._htmlAudio.remove(); this._htmlAudio = null; }
       this._createHtmlAudio();
     } else {
       this._load();
@@ -1975,6 +2307,10 @@ class Awdio {
   }
 
   get currentTime() {
+    // 麦克风：返回已采集时长
+    if (this._isMic) {
+      return this._micConnected ? (this._ctx.currentTime - this._micStartedAt) : 0;
+    }
     if (this._useHtmlAudio && this._htmlAudio) {
       return this._htmlAudio.currentTime;
     }
@@ -1989,6 +2325,8 @@ class Awdio {
   }
 
   get duration() {
+    // 麦克风为实时流，无固定时长
+    if (this._isMic) return Infinity;
     if (this._useHtmlAudio && this._htmlAudio) {
       return this._htmlAudio.duration || 0;
     }
@@ -2000,12 +2338,13 @@ class Awdio {
 
   set duration(sec) {
     this._duration = Math.max(0.01, sec);
-    if (!this._src && (this._formula || this._type)) {
+    if (!this._src && !this._isMic && (this._formula || this._type)) {
       this._buffer = this._createBuffer(this._formula || this._type, this._freq);
     }
   }
 
   get playing() {
+    if (this._isMic) return this._micConnected;
     if (this._useHtmlAudio && this._htmlAudio) {
       return !this._htmlAudio.paused;
     }
@@ -2055,6 +2394,20 @@ class Awdio {
   }
 
   /**
+   * 设置/获取微调音高（音分 cents，±100 = 一个半音）
+   * 仅 Web Audio 模式生效（HTML5 模式不支持 detune）
+   * @param {number} [cents] - 音分值（如 +50 升半音，-50 降半音），不传获取当前值
+   */
+  detune(cents) {
+    if (cents === undefined) return this._detune;
+    this._detune = Math.max(-1200, Math.min(1200, cents));
+    this._activeSources.forEach(s => {
+      try { s.detune.value = this._detune; } catch (e) {}
+    });
+    return this;
+  }
+
+  /**
    * 设置/获取倒放
    * @param {boolean} [rev] - 是否倒放，不传获取当前值
    */
@@ -2075,11 +2428,13 @@ class Awdio {
       let stepMs = dur * 1000 / steps;
       let startVol = this._htmlAudio.volume;
       let step = 0;
-      let interval = setInterval(() => {
+      if (this._fadeOutInterval) clearInterval(this._fadeOutInterval);
+      this._fadeOutInterval = setInterval(() => {
         step++;
         this._htmlAudio.volume = Math.max(0, startVol * (1 - step / steps));
         if (step >= steps) {
-          clearInterval(interval);
+          clearInterval(this._fadeOutInterval);
+          this._fadeOutInterval = null;
           this.stop();
           this._applyVolume();
         }
@@ -2090,7 +2445,9 @@ class Awdio {
     this._gainNode.gain.cancelScheduledValues(now);
     this._gainNode.gain.setValueAtTime(this._gainNode.gain.value, now);
     this._gainNode.gain.linearRampToValueAtTime(0, now + dur);
-    setTimeout(() => {
+    if (this._fadeOutTimer) clearTimeout(this._fadeOutTimer);
+    this._fadeOutTimer = setTimeout(() => {
+      this._fadeOutTimer = null;
       this.stop();
       this._applyVolume();
     }, dur * 1000 + 100);
@@ -2175,6 +2532,24 @@ class Awdio {
     return this;
   }
 
+  /**
+   * 立体声平衡（StereoPanner）
+   * @param {number} [val] - -1（最左）~ 1（最右），0 = 居中；不传获取当前值
+   * @returns {this|number}
+   *
+   * 示例：.pan(-0.5)     // 声像偏左
+   *       .pan(1)        // 声像到最右
+   *       .pan()         // 获取当前声像
+   *       .pan(0)        // 恢复居中
+   */
+  pan(val) {
+    if (val === undefined) {
+      return this._stereoPanner ? this._stereoPanner.pan.value : 0;
+    }
+    this.param('pan', val);
+    return this;
+  }
+
   // ==================== 音效处理 ====================
 
   reverb(opts) {
@@ -2195,23 +2570,69 @@ class Awdio {
 
     let room = opts.room != null ? Math.max(0, Math.min(1, opts.room)) : 0.5;
     let damp = opts.damp != null ? Math.max(0, Math.min(1, opts.damp)) : 0.5;
-    let mix  = opts.mix  != null ? Math.max(0, Math.min(1, opts.mix))  : 0.5;
+    // wet 为 wad 兼容别名，与 mix 等价
+    let mix  = opts.mix  != null ? Math.max(0, Math.min(1, opts.mix))
+            : opts.wet != null ? Math.max(0, Math.min(1, opts.wet))
+            : 0.5;
 
     if (!this._reverbNode) {
       this._reverbNode = this._ctx.createConvolver();
-      this._reverbNode.buffer = this._createReverbIR(room, damp);
       this._reverbDry = this._ctx.createGain();
       this._reverbDry.gain.value = 1 - mix;
       this._reverbWet = this._ctx.createGain();
       this._reverbWet.gain.value = mix;
       this._rebuildChain();
     } else {
-      this._reverbNode.buffer = this._createReverbIR(room, damp);
       this._reverbDry.gain.value = 1 - mix;
       this._reverbWet.gain.value = mix;
     }
 
+    if (opts.impulse != null) {
+      // 外部脉冲响应文件（URL / ArrayBuffer / Blob / File）：异步加载，就绪后自动生效
+      this._loadImpulse(opts.impulse);
+    } else {
+      // 无 impulse 时使用自生成噪声 IR（离线可用，不依赖外部资源）
+      this._reverbNode.buffer = this._createReverbIR(room, damp);
+    }
+
     return this;
+  }
+
+  /**
+   * 加载混响脉冲响应（impulse response）
+   * @param {string|ArrayBuffer|Blob|File} input - impulse 文件 URL / 二进制数据
+   * 加载完成后自动设置到 ConvolverNode，并触发 'load'（type='reverb-impulse'）事件
+   */
+  _loadImpulse(input) {
+    if (this._destroyed) return;
+    let ctx = this._ctx;
+    let promise;
+
+    if (typeof input === 'string') {
+      promise = fetch(input).then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.arrayBuffer();
+      });
+    } else if (input instanceof ArrayBuffer || (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(input) && input.buffer instanceof ArrayBuffer)) {
+      promise = Promise.resolve(input.buffer ? input.buffer : input);
+    } else if (input instanceof Blob) {
+      promise = input.arrayBuffer();
+    } else {
+      console.warn('Awdio: reverb impulse 参数类型不支持', input);
+      return;
+    }
+
+    promise
+      .then(buf => ctx.decodeAudioData(buf.slice(0)))
+      .then(decoded => {
+        if (this._destroyed || !this._reverbNode) return;
+        this._reverbNode.buffer = decoded;
+        this._emit('load', { type: 'reverb-impulse', src: typeof input === 'string' ? input : null });
+      })
+      .catch(e => {
+        console.error('Awdio: 加载混响 impulse 失败', e);
+        this._emit('error', { error: e, type: 'reverb-impulse' });
+      });
   }
 
   _createReverbIR(room, damp) {
@@ -2261,6 +2682,79 @@ class Awdio {
     this._compNode.knee.value = knee;
     this._compNode.ratio.value = ratio;
     this._compGainNode.gain.value = gain;
+
+    return this;
+  }
+
+  /**
+   * 延迟效果（Echo / Delay）
+   * @param {object|number} [opts] - 配置对象 / time值(秒) / falsy 表示关闭
+   *   opts.time:      延迟时间 秒（默认 0.3）
+   *   opts.feedback:  反馈量 0-0.95（默认 0.4），越大回声越多
+   *   opts.mix:       干湿比 0-1（默认 0.4）
+   *   opts.filterFreq: 反馈低通截止频率 Hz（可选，默认不滤波）
+   *
+   * 示例：.delay({ time: 0.35, feedback: 0.5, mix: 0.4 })
+   *       .delay(0.5)      // 仅设置延迟时间
+   *       .delay()         // 关闭延迟
+   *       .delay({ time: 0.3, feedback: 0.3, mix: 0.3, filterFreq: 3000 })
+   */
+  delay(opts) {
+    if (opts === undefined || opts === false || opts === null) {
+      if (this._delayNode) {
+        this._delayNode.disconnect(); this._delayNode = null;
+        this._delayDry.disconnect(); this._delayDry = null;
+        this._delayWet.disconnect(); this._delayWet = null;
+        this._delayMix.disconnect(); this._delayMix = null;
+        this._delayFeedback.disconnect(); this._delayFeedback = null;
+        if (this._delayFilter) { this._delayFilter.disconnect(); this._delayFilter = null; }
+        this._rebuildChain();
+      }
+      return this;
+    }
+
+    if (typeof opts === 'number') opts = { time: opts };
+
+    let time       = opts.time       != null ? Math.max(0.001, Math.min(5, opts.time)) : 0.3;
+    let feedback   = opts.feedback   != null ? Math.max(0, Math.min(0.95, opts.feedback)) : 0.4;
+    let mix        = opts.mix        != null ? Math.max(0, Math.min(1, opts.mix)) : 0.4;
+    let filterFreq = opts.filterFreq != null ? Math.max(20, Math.min(20000, opts.filterFreq)) : null;
+
+    if (!this._delayNode) {
+      this._delayNode = this._ctx.createDelay(5);
+      this._delayNode.delayTime.value = time;
+
+      this._delayDry = this._ctx.createGain();
+      this._delayDry.gain.value = 1 - mix;
+      this._delayWet = this._ctx.createGain();
+      this._delayWet.gain.value = mix;
+      this._delayMix = this._ctx.createGain();
+      this._delayMix.gain.value = 1;
+
+      // 反馈环：delayNode → feedback → delayNode
+      this._delayFeedback = this._ctx.createGain();
+      this._delayFeedback.gain.value = feedback;
+      this._delayNode.connect(this._delayFeedback);
+      this._delayFeedback.connect(this._delayNode);
+
+      if (filterFreq != null) {
+        this._delayFilter = this._ctx.createBiquadFilter();
+        this._delayFilter.type = 'lowpass';
+        this._delayFilter.frequency.value = filterFreq;
+        this._delayNode.connect(this._delayFilter);
+        this._delayFilter.connect(this._delayWet);
+      } else {
+        this._delayNode.connect(this._delayWet);
+      }
+
+      this._rebuildChain();
+    } else {
+      this._delayNode.delayTime.value = time;
+      this._delayFeedback.gain.value = feedback;
+      this._delayDry.gain.value = 1 - mix;
+      this._delayWet.gain.value = mix;
+      if (filterFreq != null && this._delayFilter) this._delayFilter.frequency.value = filterFreq;
+    }
 
     return this;
   }
@@ -2471,6 +2965,7 @@ class Awdio {
           this._phaserLFOs.forEach(l => { try { l.stop(); l.disconnect(); } catch (e) {} });
           this._phaserLFOs = null;
         }
+        this._phaserFilters = null;
         this._phaserNode.disconnect();
         this._phaserNode = null;
         this._phaserDry.disconnect();
@@ -2525,6 +3020,7 @@ class Awdio {
       apf.Q.value = fb * 5;
       allpassFilters.push(apf);
     }
+    this._phaserFilters = allpassFilters;
 
     // 串联 allpass 链
     for (let s = 0; s < stages; s++) {
@@ -2579,6 +3075,17 @@ class Awdio {
 
     let buffer = this._createPluckBuffer(freqVal, duration, decay);
     this._buffer = buffer;
+
+    // 拨弦必须走 Web Audio 合成链：若实例处于 HTML5 模式，切换到 WebAudio
+    if (this._useHtmlAudio) {
+      this._useHtmlAudio = false;
+      if (this._htmlAudio) {
+        this._htmlAudio.pause();
+        this._htmlAudio.remove();
+        this._htmlAudio = null;
+        if (Awdio._htmlAudioInstances) Awdio._htmlAudioInstances.delete(this);
+      }
+    }
 
     // 停止当前播放并播放新音
     this._stopAllSources();
@@ -2891,7 +3398,7 @@ class Awdio {
     // 特殊处理 freq / speed
     if (key === 'freq') {
       this._freq = Math.max(20, Math.min(20000, val));
-      if (!this._src && (this._formula || this._type)) {
+      if (!this._src && !this._isMic && (this._formula || this._type)) {
         this._buffer = this._createBuffer(this._formula || this._type, this._freq);
       }
       return this;
@@ -3170,11 +3677,28 @@ class Awdio {
     // 从全局 HTML5 实例列表中移除
     if (Awdio._htmlAudioInstances) Awdio._htmlAudioInstances.delete(this);
 
+    // 清理麦克风采集
+    if (this._isMic) {
+      this._teardownMic();
+    }
+    // 回收 load(file) 创建的 object URL
+    if (this._objectUrl) {
+      try { URL.revokeObjectURL(this._objectUrl); } catch (e) {}
+      this._objectUrl = null;
+    }
+
     this._stopAllSources();
     if (this._releaseTimeoutId) clearTimeout(this._releaseTimeoutId);
+    if (this._fadeOutTimer) { clearTimeout(this._fadeOutTimer); this._fadeOutTimer = null; }
+    if (this._fadeOutInterval) { clearInterval(this._fadeOutInterval); this._fadeOutInterval = null; }
     if (this._chorusLFO) { try { this._chorusLFO.stop(); this._chorusLFO.disconnect(); } catch (e) {} }
     if (this._phaserLFOs) {
       this._phaserLFOs.forEach(l => { try { l.stop(); l.disconnect(); } catch (e) {} });
+    }
+    if (this._delayNode) {
+      try { this._delayNode.disconnect(); } catch (e) {}
+      try { this._delayFeedback.disconnect(); } catch (e) {}
+      if (this._delayFilter) { try { this._delayFilter.disconnect(); } catch (e) {} }
     }
     this._chainInput.disconnect();
     if (this._envelopeNode) this._envelopeNode.disconnect();
@@ -3227,8 +3751,11 @@ class _AwdioManager {
     this._paused = false;
     this._stopped = false;
     this._wasPausedByGlobal = false;
+    this._wasPausedByBackground = false;
     this._timeoutId = null;
+    this._timeoutIds = []; // 并行模式下的多个延迟定时器
     this._currentPlaying = null;
+    this._currentEndHandler = null; // 当前播放项的 end 监听（供 next/prev 移除）
     this._events = {};
     this._perItemDelays = []; // 逐项延迟（毫秒），与 _items 一一对应
 
@@ -3257,6 +3784,7 @@ class _AwdioManager {
   }
 
   _bindVisibility() {
+    if (this._visibilityHandler) return; // 防重复绑定
     this._visibilityHandler = () => {
       if (document.hidden) {
         if (this._playing && !this._paused && this._pauseOnBack) {
@@ -3280,6 +3808,27 @@ class _AwdioManager {
     }
   }
 
+  /**
+   * 清除所有挂起的延迟定时器（顺序 + 并行）
+   */
+  _clearTimeouts() {
+    if (this._timeoutId) { clearTimeout(this._timeoutId); this._timeoutId = null; }
+    if (this._timeoutIds) {
+      this._timeoutIds.forEach(id => clearTimeout(id));
+      this._timeoutIds = [];
+    }
+  }
+
+  /**
+   * 注册一个延迟定时器（统一管理，便于暂停/停止时清理）
+   */
+  _schedule(fn, ms) {
+    let id = setTimeout(fn, ms);
+    if (this._timeoutIds) this._timeoutIds.push(id);
+    else this._timeoutId = id;
+    return id;
+  }
+
   play(...indices) {
     if (this._items.length === 0) return this;
     this._stopped = false;
@@ -3300,6 +3849,12 @@ class _AwdioManager {
     } else {
       if (this._mode === 'parallel') {
         this._playAllParallel();
+      } else if (this._paused && this._currentIndex >= 0 && this._currentIndex < this._items.length) {
+        // 暂停后恢复：继续播放当前项（从暂停位置继续），而不是从头
+        let item = this._items[this._currentIndex];
+        this._currentPlaying = item;
+        item.play();
+        this._emit('play', { index: this._currentIndex, instance: item });
       } else {
         this._playSequential(0);
       }
@@ -3310,10 +3865,7 @@ class _AwdioManager {
   pause(...indices) {
     if (indices.length === 0) {
       this._paused = true;
-      if (this._timeoutId) {
-        clearTimeout(this._timeoutId);
-        this._timeoutId = null;
-      }
+      this._clearTimeouts();
       this._items.forEach(item => {
         if (item.playing) item.pause();
       });
@@ -3331,13 +3883,11 @@ class _AwdioManager {
     this._stopped = true;
     this._paused = false;
     this._playing = false;
-    if (this._timeoutId) {
-      clearTimeout(this._timeoutId);
-      this._timeoutId = null;
-    }
+    this._clearTimeouts();
     this._items.forEach(item => item.stop());
     this._currentIndex = -1;
     this._currentPlaying = null;
+    this._currentEndHandler = null;
     this._unbindVisibility();
     Awdio._managers.delete(this);
     this._emit('stop');
@@ -3377,13 +3927,14 @@ class _AwdioManager {
 
     let onEnd = () => {
       item.off('end', onEnd);
+      this._currentEndHandler = null;
       item._loop = origLoop;
       this._currentPlaying = null;
       let idx = this._currentIndex;
       this._currentIndex++;
       let perDelay = (this._perItemDelays && this._perItemDelays[idx] > 0) ? this._perItemDelays[idx] : this._delay;
       if (perDelay > 0) {
-        this._timeoutId = setTimeout(() => {
+        this._schedule(() => {
           this._playSequential(this._currentIndex);
         }, perDelay);
       } else {
@@ -3391,34 +3942,161 @@ class _AwdioManager {
       }
     };
 
+    this._currentEndHandler = onEnd;
     item.on('end', onEnd);
     item.play();
     this._emit('play', { index: this._currentIndex, instance: item });
+  }
+
+  // ==================== 队列导航 ====================
+
+  /**
+   * 停止当前播放项并清除挂起的延迟，但保留队列管理器状态
+   * （供 next/prev/setPlay 切换曲目时使用）
+   */
+  _stopCurrent() {
+    this._clearTimeouts();
+    let cur = this._currentPlaying;
+    if (cur) {
+      if (this._currentEndHandler) {
+        cur.off('end', this._currentEndHandler);
+        this._currentEndHandler = null;
+      }
+      cur.stop();
+      this._currentPlaying = null;
+    }
+    // 停止并行模式下其它仍在播放的项
+    if (this._mode === 'parallel') {
+      this._items.forEach(it => { if (it.playing) it.stop(); });
+    }
+  }
+
+  /**
+   * 从指定索引开始播放（sequential 走顺序链路；parallel 仅播该项）
+   * @param {number} index - 0-based 索引
+   */
+  _playSingle(index) {
+    if (index < 0 || index >= this._items.length) return;
+    this._playing = true;
+    this._paused = false;
+    this._stopped = false;
+    this._wasPausedByBackground = false;
+    // 重新注册为活跃管理器（可能已被 end 移除）并恢复后台暂停监听
+    Awdio._managers.add(this);
+    this._bindVisibility();
+
+    if (this._mode === 'sequential') {
+      this._playSequential(index);
+    } else {
+      this._currentIndex = index;
+      let item = this._items[index];
+      this._currentPlaying = item;
+      item.play();
+      this._emit('play', { index, instance: item });
+    }
+  }
+
+  /**
+   * 播放队列中指定位置（1-based，1 = 第一首）
+   * @param {number} index - 第几首
+   * @returns {this}
+   *
+   * 示例：mgr.setPlay(1)  // 播放队列第一首
+   *       mgr.setPlay(3)  // 播放队列第三首
+   */
+  setPlay(index) {
+    if (this._items.length === 0) return this;
+    let i = Math.floor(Number(index)) - 1;
+    if (isNaN(i) || i < 0 || i >= this._items.length) return this;
+    this._stopCurrent();
+    this._playSingle(i);
+    return this;
+  }
+
+  /**
+   * 下一首：相对当前曲目往后跳 n 首（缺省 1，越界回绕到队首）
+   * @param {number} [n] - 步数，默认 1
+   * @returns {this}
+   *
+   * 示例：mgr.next()    // 下一首
+   *       mgr.next(2)   // 下两首
+   */
+  next(n) {
+    if (this._items.length === 0) return this;
+    let step = (n === undefined || n === null) ? 1 : Math.max(1, Math.floor(Number(n)) || 1);
+    let target;
+    if (this._currentIndex < 0 || this._currentIndex >= this._items.length) {
+      target = 0; // 尚未播放或已播完：从队首开始
+    } else {
+      target = (this._currentIndex + step) % this._items.length;
+    }
+    this._stopCurrent();
+    this._playSingle(target);
+    return this;
+  }
+
+  /**
+   * 上一首：相对当前曲目往前跳 n 首（缺省 1，越界回绕到队尾）
+   * @param {number} [n] - 步数，默认 1
+   * @returns {this}
+   *
+   * 示例：mgr.prev()    // 上一首
+   *       mgr.prev(2)   // 上两首
+   */
+  prev(n) {
+    if (this._items.length === 0) return this;
+    let step = (n === undefined || n === null) ? 1 : Math.max(1, Math.floor(Number(n)) || 1);
+    let target;
+    if (this._currentIndex < 0 || this._currentIndex >= this._items.length) {
+      target = this._items.length - 1; // 尚未播放或已播完：从队尾开始
+    } else {
+      target = (this._currentIndex - step) % this._items.length;
+      if (target < 0) target += this._items.length;
+    }
+    this._stopCurrent();
+    this._playSingle(target);
+    return this;
   }
 
   _playAllParallel() {
     if (this._stopped) return;
     this._playing = true;
 
+    // 支持逐项延迟：[a, 60, b, 100, c] → a@0ms, b@60ms, c@160ms（数字累加到其后 item 的启动时刻）
+    let cumulative = 0;
     this._items.forEach((item, index) => {
-      if (this._fadeIn || item._fadeIn) {
-        item._fadeIn = true;
-        item._fadeInDuration = this._fadeInDuration || item._fadeInDuration;
-      }
-      if (this._fadeOut || item._fadeOut) {
-        item._fadeOut = true;
-        item._fadeOutDuration = this._fadeOutDuration || item._fadeOutDuration;
+      if (index >= 1) {
+        let itemDelay = (this._perItemDelays && this._perItemDelays[index] > 0) ? this._perItemDelays[index] : 0;
+        cumulative += itemDelay;
       }
 
-      item.play();
-      this._emit('play', { index, instance: item });
+      let startItem = () => {
+        if (this._stopped) return;
+        if (this._fadeIn || item._fadeIn) {
+          item._fadeIn = true;
+          item._fadeInDuration = this._fadeInDuration || item._fadeInDuration;
+        }
+        if (this._fadeOut || item._fadeOut) {
+          item._fadeOut = true;
+          item._fadeOutDuration = this._fadeOutDuration || item._fadeOutDuration;
+        }
 
-      if (this._loop) {
-        let onEnd = () => {
-          item.off('end', onEnd);
-          item.play();
-        };
-        item.on('end', onEnd);
+        item.play();
+        this._emit('play', { index, instance: item });
+
+        if (this._loop) {
+          let onEnd = () => {
+            item.off('end', onEnd);
+            item.play();
+          };
+          item.on('end', onEnd);
+        }
+      };
+
+      if (cumulative > 0) {
+        this._schedule(startItem, cumulative);
+      } else {
+        startItem();
       }
     });
   }

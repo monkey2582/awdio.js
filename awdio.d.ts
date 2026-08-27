@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
- * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
- * @version 3.11.0
+ * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、麦克风、队列播放、链式调用等
+ * @version 3.14.0
  */
 
 declare class Awdio {
@@ -11,8 +11,20 @@ declare class Awdio {
   /** 用户自定义公式注册表 */
   static readonly _formulas: Map<string, (t: number, freq: number, sr: number, opts: Readonly<AwdioOptions>) => number>;
 
+  /** 全局音频缓存：URL → 已解码 AudioBuffer */
+  static readonly _audioCache: Map<string, AudioBuffer>;
+
   /** 获取/创建共享 AudioContext */
   static getContext(): AudioContext;
+
+  /**
+   * 手动解锁 AudioContext（自动播放策略）
+   * 通常在用户手势回调中调用；getContext 已自动注册全局解锁，一般无需手动调用
+   */
+  static unlock(): Awdio;
+
+  /** 清空全局音频缓存 */
+  static clearCache(): Awdio;
 
   /** 获取/创建全局增益节点 */
   static getGlobalGainNode(): GainNode;
@@ -137,6 +149,15 @@ declare class Awdio {
    */
   static playAll(...args: any[]): AwdioManager;
 
+  /**
+   * 创建实例并加载本地音频文件
+   * @param file - File/Blob 对象、ArrayBuffer/TypedArray、或音频 URL/路径字符串
+   * @param opts - 实例选项（如 { autoplay: true, volume: 80 }）
+   *
+   * 示例：let a = Awdio.load(fileInput.files[0], { autoplay: true })
+   */
+  static load(file: File | Blob | ArrayBuffer | ArrayBufferView | string, opts?: AwdioOptions): Awdio;
+
   // ==================== 构造函数 ====================
 
   /**
@@ -158,10 +179,12 @@ declare class Awdio {
 
   /**
    * 注册事件
-   * 支持事件：'play' | 'pause' | 'stop' | 'end' | 'load' | 'progress' | 'error' | 'destroy' | 'deviceLost'
+   * 支持事件：'play' | 'pause' | 'stop' | 'end' | 'load' | 'progress' | 'error' | 'destroy' | 'deviceLost' | 'micready'
    *
    * 'deviceLost' - 输出设备断开时触发，自动降回扬声器
    *   data: { prevDevice: string[] } - 断开的设备 ID 列表
+   * 'micready'   - 麦克风流就绪时触发（type:'mic' 模式）
+   *   data: { stream: MediaStream } - 麦克风媒体流
    */
   on(event: string, fn: (data?: any) => void): this;
   /** 移除事件 */
@@ -199,6 +222,16 @@ declare class Awdio {
    * 支持格式：seek(10) / seek("1:30") / seek("1:30:00")
    */
   seek(time: number | string): this;
+
+  /**
+   * 加载本地音频文件（File / Blob / ArrayBuffer / URL 字符串）
+   * @param file - File/Blob 对象、二进制数据、或音频 URL/路径
+   * @param opts - 可选：{ autoplay: true } 加载完成后自动播放
+   *
+   * 示例：awdio.load(fileInput.files[0])
+   *       awdio.load(file, { autoplay: true })
+   */
+  load(file: File | Blob | ArrayBuffer | ArrayBufferView | string, opts?: { autoplay?: boolean }): this;
 
   // ==================== 选项设置 ====================
 
@@ -283,6 +316,14 @@ declare class Awdio {
   pitch(rate: number): this;
 
   /**
+   * 设置/获取微调音高（音分 cents，±100 = 一个半音）
+   * 仅 Web Audio 模式生效（HTML5 模式不支持 detune）
+   * @param cents - 音分值（如 +50 升半音，-50 降半音），不传获取当前值
+   */
+  detune(): number;
+  detune(cents: number): this;
+
+  /**
    * 设置/获取倒放
    * @param rev - 是否倒放，不传获取当前值
    */
@@ -306,6 +347,15 @@ declare class Awdio {
    *       .spatial()          // 关闭 3D 定位
    */
   spatial(opts?: { x?: number; y?: number; z?: number } | number | false | null): this;
+
+  /**
+   * 立体声平衡（StereoPanner）
+   * @param val - -1（最左）~ 1（最右），0 = 居中；不传获取当前值
+   *
+   * 示例：.pan(-0.5)  .pan(1)  .pan()  .pan(0)
+   */
+  pan(): number;
+  pan(val: number): this;
 
   // ==================== 音效处理 ====================
 
@@ -392,6 +442,20 @@ declare class Awdio {
    *       .phaser()      // 关闭移相
    */
   phaser(opts?: PhaserOptions | number | false | null): this;
+
+  /**
+   * 延迟效果（Echo / Delay）
+   * @param opts - 配置对象 / time值(秒) / falsy 表示关闭
+   *   opts.time:       延迟时间 秒（默认 0.3）
+   *   opts.feedback:   反馈量 0-0.95（默认 0.4），越大回声越多
+   *   opts.mix:        干湿比 0-1（默认 0.4）
+   *   opts.filterFreq: 反馈低通截止频率 Hz（可选，默认不滤波）
+   *
+   * 示例：.delay({ time: 0.35, feedback: 0.5, mix: 0.4 })
+   *       .delay(0.5)      // 仅设置延迟时间
+   *       .delay()         // 关闭延迟
+   */
+  delay(opts?: DelayOptions | number | false | null): this;
 
   /**
    * 拨弦：使用 Karplus-Strong 算法生成拨弦音并播放
@@ -593,16 +657,42 @@ type AwdioWaveType =
   // 模拟合成器
   | 'synth_bass' | 'synth_lead' | 'synth_pad' | 'supersaw' | 'sub_bass'
   // 效果音
-  | 'laser' | 'sweep' | 'bubble' | 'click';
+  | 'laser' | 'sweep' | 'bubble' | 'click'
+  // 麦克风实时音频
+  | 'mic';
+
+/** 麦克风选项 */
+interface MicOptions {
+  /** 指定麦克风输入设备 ID */
+  deviceId?: string;
+  /** 回声消除（默认 true） */
+  echoCancellation?: boolean;
+  /** 降噪（默认 true） */
+  noiseSuppression?: boolean;
+  /** 自动增益（默认 true） */
+  autoGainControl?: boolean;
+}
 
 /** 混响效果选项 */
 interface ReverbOptions {
-  /** 房间大小 0-1（默认 0.5） */
+  /** 房间大小 0-1（默认 0.5），使用自生成 IR 时生效 */
   room?: number;
-  /** 高频阻尼 0-1（默认 0.5） */
+  /** 高频阻尼 0-1（默认 0.5），使用自生成 IR 时生效 */
   damp?: number;
   /** 干湿比 0-1（默认 0.5） */
   mix?: number;
+  /**
+   * 湿信号比例 0-1（wad 兼容写法，与 mix 等价）
+   * 示例：reverb: { wet: 0.5 }
+   */
+  wet?: number;
+  /**
+   * 外部脉冲响应文件（URL / ArrayBuffer / Blob / File）
+   * 提供后优先使用，异步加载完成自动生效并触发 'load'（type='reverb-impulse'）
+   * 不提供则使用内置自生成噪声 IR（离线可用）
+   * 示例：reverb: { wet: 0.5, impulse: 'path/to/impulse.wav' }
+   */
+  impulse?: string | ArrayBuffer | Blob | File;
 }
 
 /** 压缩器效果选项 */
@@ -669,6 +759,18 @@ interface PhaserOptions {
   stages?: number;
 }
 
+/** 延迟效果选项 */
+interface DelayOptions {
+  /** 延迟时间 秒（默认 0.3） */
+  time?: number;
+  /** 反馈量 0-0.95（默认 0.4），越大回声越多 */
+  feedback?: number;
+  /** 干湿比 0-1（默认 0.4） */
+  mix?: number;
+  /** 反馈低通截止频率 Hz（可选，默认不滤波） */
+  filterFreq?: number;
+}
+
 /** FFT 频谱分析器选项 */
 interface AnalyserOptions {
   /** FFT 窗口大小，32~32768 的 2 的幂（默认 2048） */
@@ -700,8 +802,17 @@ interface AwdioOptions {
    * fn(t, freq, sr, opts) => -1~1
    */
   formula?: ((t: number, freq: number, sr: number, opts: Readonly<AwdioOptions>) => number);
-  /** 合成波形类型（支持内置类型、自定义公式名、或直接传入公式函数） */
+  /** 合成波形类型（支持内置类型、自定义公式名、或直接传入公式函数；'mic' 为麦克风实时音频） */
   type?: AwdioWaveType | ((t: number, freq: number, sr: number, opts: Readonly<AwdioOptions>) => number);
+  /**
+   * 麦克风实时音频：true 开启，或传 MicOptions 配置
+   * 也可通过 type:'mic' 开启
+   *
+   * 示例：mic: true                        // 默认麦克风
+   *       mic: { echoCancellation: false } // 关闭回声消除
+   *       new Awdio('mic').play()
+   */
+  mic?: boolean | MicOptions;
   /** 合成音频频率 (Hz) */
   freq?: number;
   /** 合成音频时长（秒，默认 2） */
@@ -730,6 +841,8 @@ interface AwdioOptions {
   name?: string;
   /** 输出设备 ID 或设备 ID 数组 */
   device?: string | string[];
+  /** 立体声平衡 -1（最左）~ 1（最右），默认 0 */
+  pan?: number;
   /** 是否启用淡入淡出（统一设置 fadeIn 和 fadeOut） */
   fade?: boolean;
   /** 是否启用淡入 */
@@ -746,6 +859,10 @@ interface AwdioOptions {
   speed?: number;
   /** 音高比率 0.1~10（默认 1），1=原声，2=高八度 */
   pitch?: number;
+  /** 微调音高 音分（默认 0），±100 = 一个半音 */
+  detune?: number;
+  /** 是否参与全局音频缓存（默认 true；同一 URL 只 fetch+解码一次） */
+  cache?: boolean;
   /** 是否倒放（默认 false） */
   reverse?: boolean;
   /** 
@@ -819,6 +936,33 @@ interface AwdioManager {
    * @param b - 第二个位置
    */
   toggle(a: number, b: number): this;
+
+  /**
+   * 播放队列中指定位置（1-based，1 = 第一首）
+   * @param index - 第几首
+   *
+   * 示例：mgr.setPlay(1)  // 播放队列第一首
+   *       mgr.setPlay(3)  // 播放队列第三首
+   */
+  setPlay(index: number): this;
+
+  /**
+   * 下一首：相对当前曲目往后跳 n 首（缺省 1，越界回绕到队首）
+   * @param n - 步数（默认 1）
+   *
+   * 示例：mgr.next()    // 下一首
+   *       mgr.next(2)   // 下两首
+   */
+  next(n?: number): this;
+
+  /**
+   * 上一首：相对当前曲目往前跳 n 首（缺省 1，越界回绕到队尾）
+   * @param n - 步数（默认 1）
+   *
+   * 示例：mgr.prev()    // 上一首
+   *       mgr.prev(2)   // 上两首
+   */
+  prev(n?: number): this;
 
   /**
    * 设置/获取队列逐项延迟（毫秒）
