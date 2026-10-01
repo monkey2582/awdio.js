@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
- * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、麦克风、队列播放、链式调用等
- * @version 3.14.0
+ * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
+ * @version 4.0.0
  */
 
 declare class Awdio {
@@ -29,10 +29,10 @@ declare class Awdio {
   /** 获取/创建全局增益节点 */
   static getGlobalGainNode(): GainNode;
 
-  /** 设置全局音量（百分制，0-100） */
+  /** 设置全局音量（0~1） */
   static setGlobalVolume(vol: number): void;
 
-  /** 获取全局音量 */
+  /** 获取全局音量（0~1） */
   static getGlobalVolume(): number;
 
   /**
@@ -115,6 +115,20 @@ declare class Awdio {
   /** 判断字符串是否为 URL */
   static _isURL(str: string): boolean;
 
+  /**
+   * 规范化 loop 入参为内部播放次数（内部使用）
+   * 存法：完整播放的次数，1 = 只播一遍，Infinity = 无限循环
+   * 任意负数 ( -1 / -2 / -Infinity / '-3' … ) / 0 / 'inf' / 'infinite' / 'infinity' / 'forever' / 'true' → Infinity
+   * false / null / undefined / NaN / 非法值 → 1；n > 1 → Math.floor(n)
+   */
+  static _as(val: number | string | boolean | null | undefined): number;
+
+  /**
+   * 内部播放次数 → 对外 loop 语义（内部使用）
+   * Infinity → true；0 / 1 / 非法 → false；其余数字原样返回
+   */
+  static _lv(n: number): boolean | number;
+
   /** 判断字符串是否为 data URI */
   static _isDataURI(str: string): boolean;
 
@@ -152,7 +166,7 @@ declare class Awdio {
   /**
    * 创建实例并加载本地音频文件
    * @param file - File/Blob 对象、ArrayBuffer/TypedArray、或音频 URL/路径字符串
-   * @param opts - 实例选项（如 { autoplay: true, volume: 80 }）
+   * @param opts - 实例选项（如 { autoplay: true, volume: 0.8 }）
    *
    * 示例：let a = Awdio.load(fileInput.files[0], { autoplay: true })
    */
@@ -179,16 +193,49 @@ declare class Awdio {
 
   /**
    * 注册事件
-   * 支持事件：'play' | 'pause' | 'stop' | 'end' | 'load' | 'progress' | 'error' | 'destroy' | 'deviceLost' | 'micready'
+   * 支持事件：'play' | 'pause' | 'stop' | 'end' | 'loop' | 'load' | 'progress' | 'error' | 'destroy' | 'deviceLost'
    *
+   * 'loop'       - 每完成一遍（非最后一遍）触发
+   *   data: { count: number, total: number } - 已完成遍数 / 总遍数（无限循环时 total 为 Infinity）
    * 'deviceLost' - 输出设备断开时触发，自动降回扬声器
    *   data: { prevDevice: string[] } - 断开的设备 ID 列表
-   * 'micready'   - 麦克风流就绪时触发（type:'mic' 模式）
-   *   data: { stream: MediaStream } - 麦克风媒体流
    */
   on(event: string, fn: (data?: any) => void): this;
   /** 移除事件 */
   off(event: string, fn: (data?: any) => void): this;
+
+  // ==================== 完成回调 ====================
+
+  /**
+   * 注册播放完成回调（播放到末尾/循环结束时触发）
+   * @param fn - 回调函数，this 指向当前实例
+   * @param waitTime - 延迟多少毫秒后触发（从 end 时刻起算，默认 0）
+   *
+   * 示例：new Awdio('sine').then(() => console.log('播完了'))
+   *       new Awdio('sine').then(() => next(), 500)  // 播完后延迟 500ms 执行
+   */
+  then(fn: (self: Awdio) => void, waitTime?: number): this;
+
+  // ==================== 循环 / 重复 ====================
+
+  /**
+   * 设置/获取循环播放。单一 API，按入参类型自动判断语义：
+   *   布尔 → 是否无限循环
+   *   数字 → 重复播放的次数（总遍数）
+   * @param val - true 无限循环 / false 只播一遍；数字 n 表示总共播放 n 遍
+   *              （任意负数、0、'inf'、'forever' 等均视为无限循环）
+   * @returns 不传时读取：无限循环返回 true，否则返回总遍数；
+   *          false 语义（只播一遍）读取为 false；传值时返回 this 便于链式调用
+   *
+   * 示例：.loop()        // → true（无限）/ 3（播 3 遍）/ false（只播一遍）
+   *       .loop(true)   // 开启无限循环
+   *       .loop(false)  // 关闭循环，只播一遍
+   *       .loop(3)      // 完整播放 3 遍后结束
+   *
+   * 注：如需得知「当前播到第几遍」，监听 'loop' / 'end' 事件的 data.count
+   */
+  loop(): boolean | number;
+  loop(val: boolean | number | string | null): this;
 
   // ==================== 播放控制 ====================
 
@@ -198,7 +245,7 @@ declare class Awdio {
    *
    * clip 模式：若配置了 clip 或通过 defineClip 定义了片段，且 arg 匹配片段名称，则播放对应片段
    * 示例: .play()
-   *       .play({ volume: 50 })
+   *       .play({ volume: 0.5 })
    *       .play("sine")
    *       .play("laser")        // clip 名称（需配置 clip 或 defineClip）
    *       .play(myFormulaFn)
@@ -240,7 +287,7 @@ declare class Awdio {
    *
    * 优先级：src > formula > type（同时传入时按此优先级选取）
    *
-   * 支持：.set({ volume: 50, loop: true })
+   * 支持：.set({ volume: 0.5, loop: true })
    *      .set({ formula: myFn })  - 设置公式
    *      .set("sine")             - 字符串形式设置波形/公式名
    *      .set("https://...")      - 字符串形式设置 URL
@@ -248,9 +295,9 @@ declare class Awdio {
    */
   set(arg: string | Partial<AwdioOptions> | ((t: number, freq: number, sr: number, opts: Readonly<AwdioOptions>) => number)): this;
 
-  /** 设置音量（百分制，0-100） */
+  /** 设置音量（0~1） */
   setVolume(vol: number): this;
-  /** 获取音量（百分制） */
+  /** 获取音量（0~1） */
   getVolume(): number;
 
   /** 静音切换 */
@@ -285,7 +332,7 @@ declare class Awdio {
   src: string | null;
   /** 当前公式函数（当使用 formula 或 type: fn 时） */
   readonly formula: ((t: number, freq: number, sr: number, opts: Readonly<AwdioOptions>) => number) | null;
-  /** 音量（百分制） */
+  /** 音量（0~1） */
   volume: number;
   /** 当前播放时间（秒） */
   currentTime: number;
@@ -536,6 +583,7 @@ declare class Awdio {
    *   'pan'        → 立体声平衡 -1~1（自动创建 StereoPanner）
    *   'freq'       → 合成频率 Hz
    *   'speed'      → 播放倍速 0.1-10
+   *   'loop'       → 循环：布尔=是否无限循环；数字=总播放遍数（'repeat' 已移除）
    *
    * 自定义参数名 → 存入 _params 字典
    */
@@ -592,19 +640,21 @@ declare class Awdio {
    * 设置/获取实例输出设备
    * @param deviceId - 单个设备 ID、设备 ID 数组、null 恢复默认、不传获取当前
    *
-   * 示例：.device('default')
-   *       .device(['id1', 'id2'])  // 多设备同步输出
-   *       .device()                // 获取当前设备配置
-   *       .device(null)            // 恢复默认
+   * 与 Awdio.setGlobalOutput() 按调用时间比较，后调用者生效。
+   *
+   * 示例：.setOutput('default')
+   *       .setOutput(['id1', 'id2'])  // 多设备同步输出
+   *       .setOutput()                // 获取当前输出配置
+   *       .setOutput(null)            // 恢复默认
    */
-  device(): string | string[] | null;
-  device(deviceId: string | string[] | null): this;
+  setOutput(): string | string[] | null;
+  setOutput(deviceId: string | string[] | null): this;
 
   // ==================== clone 方法 ====================
 
   /**
    * 克隆当前实例（不修改原实例），可选传入变更
-   * 支持 .clone()  /  .clone({ volume: 50 })  /  .clone("sine")  /  .clone("https://...")  /  .clone(fn)
+   * 支持 .clone()  /  .clone({ volume: 0.5 })  /  .clone("sine")  /  .clone("https://...")  /  .clone(fn)
    */
   clone(arg?: string | Partial<AwdioOptions> | ((t: number, freq: number, sr: number, opts: Readonly<AwdioOptions>) => number)): Awdio;
 
@@ -657,21 +707,7 @@ type AwdioWaveType =
   // 模拟合成器
   | 'synth_bass' | 'synth_lead' | 'synth_pad' | 'supersaw' | 'sub_bass'
   // 效果音
-  | 'laser' | 'sweep' | 'bubble' | 'click'
-  // 麦克风实时音频
-  | 'mic';
-
-/** 麦克风选项 */
-interface MicOptions {
-  /** 指定麦克风输入设备 ID */
-  deviceId?: string;
-  /** 回声消除（默认 true） */
-  echoCancellation?: boolean;
-  /** 降噪（默认 true） */
-  noiseSuppression?: boolean;
-  /** 自动增益（默认 true） */
-  autoGainControl?: boolean;
-}
+  | 'laser' | 'sweep' | 'bubble' | 'click';
 
 /** 混响效果选项 */
 interface ReverbOptions {
@@ -802,25 +838,25 @@ interface AwdioOptions {
    * fn(t, freq, sr, opts) => -1~1
    */
   formula?: ((t: number, freq: number, sr: number, opts: Readonly<AwdioOptions>) => number);
-  /** 合成波形类型（支持内置类型、自定义公式名、或直接传入公式函数；'mic' 为麦克风实时音频） */
+  /** 合成波形类型（支持内置类型、自定义公式名、或直接传入公式函数） */
   type?: AwdioWaveType | ((t: number, freq: number, sr: number, opts: Readonly<AwdioOptions>) => number);
-  /**
-   * 麦克风实时音频：true 开启，或传 MicOptions 配置
-   * 也可通过 type:'mic' 开启
-   *
-   * 示例：mic: true                        // 默认麦克风
-   *       mic: { echoCancellation: false } // 关闭回声消除
-   *       new Awdio('mic').play()
-   */
-  mic?: boolean | MicOptions;
   /** 合成音频频率 (Hz) */
   freq?: number;
   /** 合成音频时长（秒，默认 2） */
   duration?: number;
-  /** 音量（百分制，0-100） */
+  /** 音量（0~1，默认 1） */
   volume?: number;
-  /** 是否循环 */
-  loop?: boolean;
+  /**
+   * 循环播放。单一 API，按类型自动判断语义：
+   *   布尔 → 是否无限循环
+   *   数字 → 总共播放的遍数
+   * 任意负数、0、'inf'、'forever' 等均视为无限循环
+   *
+   * 示例：new Awdio({ type: 'sine', loop: 3 })    // 播放 3 遍
+   *       new Awdio({ type: 'sine', loop: true }) // 无限循环
+   *       Awdio.queue(a, b, { loop: 2 })          // 整队列播放 2 遍
+   */
+  loop?: boolean | number | string;
   /** 多音模式 */
   poly?: boolean;
   /** 是否自动播放 */
@@ -839,8 +875,8 @@ interface AwdioOptions {
   muted?: boolean;
   /** 实例名称 */
   name?: string;
-  /** 输出设备 ID 或设备 ID 数组 */
-  device?: string | string[];
+  /** 输出设备 ID 或设备 ID 数组（与 Awdio.setGlobalOutput 按时间戳比较，后调用者生效） */
+  output?: string | string[];
   /** 立体声平衡 -1（最左）~ 1（最右），默认 0 */
   pan?: number;
   /** 是否启用淡入淡出（统一设置 fadeIn 和 fadeOut） */
@@ -869,7 +905,7 @@ interface AwdioOptions {
    * 是否使用 HTML5 AudioElement 播放（默认自动判断）
    * 音波合成/Data URI 强制 false；网络 URL 默认 true；本地路径默认 false 但显式 true 有效
    * 设置为 true 可绕过 CORS 跨域限制，但无法使用 Web Audio 音效（reverb、filter 等）
-   * HTML5 模式下 clip 片段和 device 设备路由同样生效
+   * HTML5 模式下 clip 片段和 output 设备路由同样生效
    * queue/playAll 中传入字符串 URL 会自动创建 html:true 的实例
    */
   html?: boolean;
@@ -899,6 +935,31 @@ interface AwdioOptions {
 interface AwdioManager {
   /** 注册事件 */
   on(event: string, fn: (data?: any) => void): this;
+
+  /**
+   * 注册播放完成回调（整个队列/并行组播放结束时触发）
+   * @param fn - 回调函数，this 指向当前管理器
+   * @param waitTime - 延迟多少毫秒后触发（从 end 时刻起算，默认 0）
+   *
+   * 示例：Awdio.queue(a, b).then(() => console.log('队列播完了'))
+   *       Awdio.queue(a, b).then(() => next(), 300)
+   */
+  then(fn: (self: AwdioManager) => void, waitTime?: number): this;
+
+  /**
+   * 设置/获取整个队列的循环方式（单一 API，按类型判断）
+   * @param val - true 无限循环 / false 只播一遍；数字 n 表示整队列共播放 n 遍
+   *              （任意负数、0、'inf'、'forever' 等均视为无限循环）
+   * @returns 不传时读取：无限循环返回 true，否则返回总遍数；false 语义读取为 false
+   *
+   * 示例：mgr.loop()       // → true（无限）/ 3（播 3 遍）/ false（只播一遍）
+   *       mgr.loop(true)  // 开启无限循环
+   *       mgr.loop(3)     // 整队列播放 3 遍
+   *
+   * 注：如需得知「当前播到第几遍」，监听 'loop' / 'end' 事件的 data.count
+   */
+  loop(): boolean | number;
+  loop(val: boolean | number | string | null): this;
 
   /**
    * 开始播放
@@ -983,6 +1044,15 @@ interface AwdioManager {
    * - parallel 模式：返回正在播放的 Awdio 实例数组
    */
   readonly playingAudio: Awdio | Awdio[] | null;
+}
+
+declare namespace Awdio {
+  export { Awdio, AwdioManager };
+  export {
+    ReverbOptions, CompOptions, ChorusOptions, EnvelopeOptions, FilterOptions,
+    WaveshaperOptions, PhaserOptions, DelayOptions, AnalyserOptions, PluckOptions,
+    AwdioOptions, AwdioWaveType
+  };
 }
 
 export = Awdio;
