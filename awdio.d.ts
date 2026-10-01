@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
  * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
- * @version 4.1.0
+ * @version 4.2.0
  */
 
 declare class Awdio {
@@ -76,6 +76,41 @@ declare class Awdio {
 
   /** 通过名称销毁实例 */
   static destroy(name: string): void;
+
+  // ==================== MediaSession 集成 ====================
+
+  /**
+   * 全局 MediaSession 自动接管开关（默认 true）
+   *
+   * 开启时：实例/队列播放会自动向 navigator.mediaSession 推送 metadata 与
+   * playbackState，并接管 play / pause / stop / seek 媒体键；
+   * 队列与 playAll 还会额外接管 previoustrack / nexttrack。
+   *
+   * 设为 false 可完全关闭自动接管（自行接管 mediaSession 时使用）。
+   *
+   * 示例：Awdio.mediaSessionEnabled = false
+   */
+  static mediaSessionEnabled: boolean;
+
+  /**
+   * 设置默认媒体元数据（所有未单独调用 mediaSession() 的实例共用）
+   * @param opts - { title, artist, album, artwork }；传 null 清除
+   *
+   * 示例：Awdio.setMediaSession({ artist: '我的应用' })
+   */
+  static setMediaSession(opts?: MediaSessionOptions | null): typeof Awdio;
+
+  /** 读取默认媒体元数据 */
+  static getMediaSession(): MediaSessionOptions | null;
+
+  /** 当前接管 mediaSession 的实例或队列管理器（无则为 null） */
+  static readonly mediaSessionOwner: Awdio | AwdioManager | null;
+
+  /**
+   * 手动指定 mediaSession 接管者（不受 mediaSessionEnabled=false 影响）
+   * @param target - 实例 / 队列管理器；传 null 取消
+   */
+  static setMediaSessionOwner(target?: Awdio | AwdioManager | null): typeof Awdio;
 
   /**
    * 定义自定义声音公式
@@ -364,6 +399,29 @@ declare class Awdio {
 
   /** 获取当前所有选项 */
   getOption(): Readonly<AwdioOptions>;
+
+  // ==================== MediaSession 元数据 ====================
+
+  /**
+   * 设置/获取本实例的媒体元数据（锁屏、通知栏、耳机遥控显示的信息）
+   *
+   * - 不传参：返回当前元数据；未设置返回 null
+   * - 传 null / false：清除本实例元数据
+   * - 传字符串：等价于 { title: 字符串 }
+   * - 传对象：写入并立即同步（若本实例正在播放）
+   *
+   * 未设置的字段回退顺序：本实例 → Awdio.setMediaSession() 全局默认 → 自动推导
+   * （src 文件名 / 波形类型 / 实例名）
+   *
+   * artwork 建议使用绝对 URL 或 data URI；blob: URL 在多数系统界面无法渲染，会被过滤。
+   *
+   * 示例：music.mediaSession({ title: '夜曲', artist: 'Chopin' })
+   *       music.mediaSession({ artwork: 'https://cdn.example.com/cover.jpg' })
+   *       music.mediaSession()      // 读取
+   *       music.mediaSession(null)  // 清除
+   */
+  mediaSession(): MediaSessionOptions | null;
+  mediaSession(opts: MediaSessionOptions | string | null | false): this;
 
   // ==================== 属性 ====================
 
@@ -730,6 +788,35 @@ declare class Awdio {
   destroy(): void;
 }
 
+/** MediaSession 媒体元数据（锁屏 / 通知栏 / 耳机遥控显示的信息） */
+interface MediaSessionOptions {
+  /** 标题，缺省时自动推导（src 文件名 / 波形类型 / 实例名） */
+  title?: string;
+  /** 艺术家 */
+  artist?: string;
+  /** 专辑 */
+  album?: string;
+  /**
+   * 封面图。支持字符串或数组（可给出多尺寸，浏览器择优显示）
+   *
+   * ⚠️ 需绝对 URL 或 data URI。blob: URL（如 new Awdio(file) 的内部 objectURL）
+   * 在多数系统界面无法渲染，会被过滤并打印警告。
+   */
+  artwork?: string | ArtworkItem | Array<string | ArtworkItem>;
+  /** 内部使用：置 true 表示不推送本实例元数据 */
+  silence?: boolean;
+}
+
+/** MediaSession 封面图条目 */
+interface ArtworkItem {
+  /** 图片 URL（绝对 URL 或 data URI） */
+  src: string;
+  /** MIME 类型，如 'image/png' */
+  type?: string;
+  /** 建议尺寸，如 '512x512' */
+  sizes?: string;
+}
+
 /** Awdio 波形类型 */
 type AwdioWaveType =
   // 基础波形
@@ -966,6 +1053,16 @@ interface AwdioOptions {
    * false: 后台继续播放
    */
   pauseOnBack?: boolean;
+  /**
+   * MediaSession 媒体元数据（锁屏 / 通知栏 / 耳机遥控显示）
+   *
+   * 设置后，本实例播放时会自动推送到 navigator.mediaSession。
+   * 另可用 `Awdio.setMediaSession()` 设置全局默认，或用实例方法
+   * `.mediaSession()` 在播放过程中动态更新。
+   *
+   * 示例：new Awdio({ src: 'song.mp3', mediaSession: { title: '夜曲', artist: 'Chopin' } })
+   */
+  mediaSession?: MediaSessionOptions;
   /** Attack 起音时间 秒（默认 0.01） */
   a?: number;
   /** Release 释音时间 秒（默认 0.3） */
@@ -1128,6 +1225,34 @@ interface AwdioManager {
    * - parallel 模式：返回正在播放的 Awdio 实例数组
    */
   readonly playingAudio: Awdio | Awdio[] | null;
+
+  // ==================== MediaSession（队列接管）====================
+
+  /**
+   * 设置/获取队列级媒体元数据（覆盖单项元数据）
+   *
+   * 队列播放时自动接管 mediaSession，并把媒体键映射为队列操作：
+   *   play / pause / stop  → 队列 play / pause / stop
+   *   nexttrack            → next()
+   *   previoustrack        → prev()
+   *   seekto / seekforward / seekbackward → 代理到当前播放项
+   *
+   * 示例：Awdio.queue(a, b).mediaSession({ title: '播放列表', artist: 'Awdio' }).play()
+   */
+  mediaSession(): MediaSessionOptions | null;
+  mediaSession(opts: MediaSessionOptions | string | null | false): this;
+
+  /** 当前播放位置（秒），代理到正在播放的实例 */
+  readonly currentTime: number;
+
+  /** 当前曲目时长（秒），代理到正在播放的实例 */
+  readonly duration: number;
+
+  /**
+   * 跳转当前曲目位置（代理到正在播放的实例）
+   * 支持 seek(10) / seek("1:30")
+   */
+  seek(time: number | string): this;
 }
 
 declare namespace Awdio {
@@ -1135,7 +1260,8 @@ declare namespace Awdio {
   export {
     ReverbOptions, CompOptions, ChorusOptions, EnvelopeOptions, FilterOptions,
     WaveshaperOptions, PhaserOptions, DelayOptions, AnalyserOptions, PluckOptions,
-    AwdioOptions, AwdioWaveType
+    AwdioOptions, AwdioWaveType,
+    MediaSessionOptions, ArtworkItem
   };
 }
 

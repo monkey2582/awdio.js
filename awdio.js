@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
  * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
- * @version 4.1.0
+ * @version 4.2.0
  */
 !(function(root,factory){
   if (typeof define === 'function' && define.amd) {
@@ -285,6 +285,13 @@ class Awdio extends _AwdioBase {
   /** 活跃的 queue/playAll 管理器 */
   static _managers = new Set();
 
+  /** MediaSession 集成（见文件末尾 MediaSession 区块） */
+  static _msEnabled = true;      // 全局自动接管开关
+  static _msDefault = null;      // 默认元数据（所有实例共用）
+  static _msOwner = null;        // 当前接管 mediaSession 的实例/管理器
+  static _msForcedOwner = null;  // 在 _msEnabled=false 时仍被显式指定的接管者
+  static _msUserPaused = false;  // 最近一次暂停是否由媒体键触发
+
   /** 全局音频缓存：URL → 已解码 AudioBuffer（可用 Awdio.clearCache() 清空） */
   static _audioCache = new Map();
   /** 是否启用全局缓存（默认 true；实例可用 opts.cache:false 单独关闭） */
@@ -372,6 +379,7 @@ class Awdio extends _AwdioBase {
     { key: 'fadeInDuration',   def: 1,     queue: true },
     { key: 'fadeOutDuration',  def: 1,     queue: true },
     { key: 'pauseOnBack',      def: false, queue: true },
+    { key: 'mediaSession',     def: null,  json: true, set: (i, v) => { i.mediaSession(v); } },
     { key: 'a',                def: 0.01,  clip: v => Math.max(0, v) },
     { key: 'r',                def: 0.3,   clip: v => Math.max(0, v) },
     { key: 'output',           def: null,  json: true },
@@ -893,6 +901,311 @@ class Awdio extends _AwdioBase {
     return mgr;
   }
 
+  // ==================== MediaSession 集成 ====================
+
+  /**
+   * 全局 MediaSession 开关（默认 true）
+   *
+   * 开启后，实例播放时会自动向 navigator.mediaSession 推送 metadata 与
+   * playbackState，并接管 play / pause / stop / seek 媒体键。
+   * 设为 false 可完全关闭自动接管（适合自行接管 mediaSession 的场景）。
+   *
+   * 示例：Awdio.mediaSessionEnabled = false;
+   */
+  static get mediaSessionEnabled() {
+    return Awdio._msEnabled;
+  }
+
+  static set mediaSessionEnabled(val) {
+    let wasEnabled = Awdio._msEnabled;
+    Awdio._msEnabled = !!val;
+    if (!Awdio._msEnabled) {
+      // 关闭自动接管：仅释放「自动接管」的 owner，显式指定的 owner 保留
+      let owner = Awdio._msOwner;
+      if (owner && owner !== Awdio._msForcedOwner) Awdio._msStop(owner);
+    } else if (!wasEnabled) {
+      // 重新开启：若已有实例在播，立即补推一次
+      for (let inst of Awdio._instances.values()) {
+        if (inst.playing) { Awdio._msClaim(inst, 'playing'); break; }
+      }
+    }
+  }
+
+  /**
+   * 默认媒体元数据：所有未单独设置 mediaSession 的实例共用
+   * @param {object} opts - { title, artist, album, artwork }
+   *
+   * 示例：Awdio.setMediaSession({ title: '我的应用', artist: 'Awdio' })
+   */
+  static setMediaSession(opts) {
+    if (opts === null || opts === undefined) {
+      Awdio._msDefault = null;
+    } else if (typeof opts === 'object') {
+      Awdio._msDefault = opts;
+    }
+    Awdio._msSyncOwner();
+    return Awdio;
+  }
+
+  /** 读取默认媒体元数据 */
+  static getMediaSession() {
+    return Awdio._msDefault;
+  }
+
+  /** 当前接管 mediaSession 的实例/管理器（无则为 null） */
+  static get mediaSessionOwner() {
+    return Awdio._msOwner;
+  }
+
+  /**
+   * 手动将某个实例/管理器设为 mediaSession 接管者
+   * @param {Awdio|AwdioManager|null} target - 不传或传 null 表示清除
+   */
+  static setMediaSessionOwner(target) {
+    if (!target) {
+      Awdio._msForcedOwner = null;
+      Awdio._msClear();
+      return Awdio;
+    }
+    Awdio._msForcedOwner = target;
+    Awdio._msOwner = target;
+    target._msActive = true;
+    Awdio._msApply(target);
+    return Awdio;
+  }
+
+  /** navigator.mediaSession 是否可用 */
+  static get _msAvailable() {
+    return typeof navigator !== 'undefined' && !!navigator.mediaSession;
+  }
+
+  /**
+   * 解析 artwork：相对路径 / blob: URL 转绝对 URL
+   * （锁屏等系统界面要求绝对 URL，blob: 通常无法渲染，故过滤并告警）
+   */
+  static _msArtwork(artwork) {
+    if (!artwork) return undefined;
+    let list = Array.isArray(artwork) ? artwork : [artwork];
+    let out = [];
+    for (let raw of list) {
+      if (!raw) continue;
+      let src = typeof raw === 'string' ? raw : raw.src;
+      if (!src || typeof src !== 'string') continue;
+      if (src.indexOf('blob:') === 0) {
+        console.warn('Awdio: mediaSession artwork 不支持 blob: URL（锁屏无法渲染），请使用绝对 URL 或 data URI');
+        continue;
+      }
+      let abs = src;
+      if (typeof document !== 'undefined' && /^[a-zA-Z][\w+.-]*:/.test(src) === false) {
+        try { abs = new URL(src, document.baseURI).href; } catch (e) { abs = src; }
+      }
+      out.push(typeof raw === 'string' ? { src: abs } : Object.assign({}, raw, { src: abs }));
+    }
+    return out.length ? out : undefined;
+  }
+
+  /**
+   * 汇总某个实例/管理器的媒体元数据（实例自身 > 全局默认 > 自动推导）
+   */
+  static _msMeta(target) {
+    let inst = (target && target._mode) ? target.playingAudio : target;
+    let base = {};
+    if (Awdio._msDefault) base = Object.assign({}, Awdio._msDefault);
+
+    if (inst && inst._msMeta) {
+      base = Object.assign(base, inst._msMeta);
+    } else if (inst) {
+      // 自动推导：队列/并行模式可能返回数组，取第一个
+      if (Array.isArray(inst)) inst = inst[0];
+      if (inst) {
+        if (!base.title) {
+          base.title = inst._msTitle
+            || (inst._src ? String(inst._src).split('/').pop().split('?')[0] : null)
+            || inst._type
+            || (inst._name !== undefined ? inst._name : null)
+            || 'Awdio';
+        }
+        if (!base.artist && inst._msArtist) base.artist = inst._msArtist;
+        if (!base.album && inst._msAlbum) base.album = inst._msAlbum;
+        if (!base.artwork && inst._msArtwork) base.artwork = inst._msArtwork;
+      }
+    }
+    return base;
+  }
+
+  /** 将元数据 + 播放状态推送到 navigator.mediaSession */
+  static _msApply(target, state) {
+    if (!Awdio._msAvailable) return;
+    if (!Awdio._msEnabled && target !== Awdio._msForcedOwner) return;
+
+    let meta = Awdio._msMeta(target);
+    try {
+      if (typeof MediaMetadata === 'function') {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title:  meta.title  || 'Awdio',
+          artist: meta.artist || '',
+          album:  meta.album  || '',
+          artwork: Awdio._msArtwork(meta.artwork) || []
+        });
+      }
+    } catch (e) {
+      // MediaMetadata 构造失败（老浏览器）：忽略，不影响播放
+    }
+
+    if (state) {
+      try { navigator.mediaSession.playbackState = state; } catch (e) {}
+    }
+    Awdio._msBind(target);
+  }
+
+  /** 绑定媒体键处理器（幂等） */
+  static _msBind(target) {
+    if (!Awdio._msAvailable || !target || target._msHandlers) return;
+    let ms = navigator.mediaSession;
+
+    let call = (fn, ...args) => {
+      if (!Awdio._msEnabled && target !== Awdio._msForcedOwner) return;
+      try { fn.apply(target, args); } catch (e) {
+        console.error('Awdio: mediaSession 处理器执行失败', e);
+      }
+    };
+
+    let set = (action, fn) => {
+      try { ms.setActionHandler(action, fn); } catch (e) { /* 不支持的动作忽略 */ }
+    };
+
+    let handlers = {
+      play:  () => { Awdio._msUserPaused = false; call(target.play); },
+      pause: () => { Awdio._msUserPaused = true;  call(target.pause); },
+      stop:  () => { Awdio._msUserPaused = true;  call(target.stop);  Awdio._msClearPlaybackState(); },
+      seekbackward: (d) => { Awdio._msSeekBy(target, -(d && d.seekOffset != null ? d.seekOffset : 10)); },
+      seekforward:  (d) => { Awdio._msSeekBy(target,  (d && d.seekOffset != null ? d.seekOffset : 10)); },
+      seekto: (d) => { if (d && d.seekTime != null) Awdio._msSeekTo(target, d.seekTime); }
+    };
+
+    set('play', handlers.play);
+    set('pause', handlers.pause);
+    set('stop', handlers.stop);
+    set('seekbackward', handlers.seekbackward);
+    set('seekforward', handlers.seekforward);
+    set('seekto', handlers.seekto);
+
+    // 队列/并行管理器额外接管上一首 / 下一首
+    if (target && target._mode) {
+      set('previoustrack', () => call(target.prev));
+      set('nexttrack',     () => call(target.next));
+      handlers.previoustrack = true;
+      handlers.nexttrack = true;
+    }
+
+    target._msHandlers = handlers;
+  }
+
+  /** seekto 目标解析：优先 duration 比例，其次绝对秒 */
+  static _msSeekTo(target, seekTime) {
+    if (target && typeof target.seek !== 'function') return;
+    let inst = Array.isArray(target) ? target[0] : target;
+    if (!inst || !inst.seek) return;
+    let t = seekTime;
+    if (seekTime && typeof seekTime === 'object' && seekTime.duration != null) {
+      t = (inst.duration || 0) * seekTime.duration;
+    }
+    target.seek(Math.max(0, t));
+  }
+
+  /** 相对跳转 */
+  static _msSeekBy(target, delta) {
+    if (!target || typeof target.seek !== 'function') return;
+    target.seek(Math.max(0, (target.currentTime || 0) + delta));
+  }
+
+  /**
+   * 实例/管理器开始播放时调用：把 mediaSession 接管权移交给自己
+   *
+   * 若当前接管者是同一个**管理器**下的实例，则不抢占
+   * （队列切换曲目时接管权应留在管理器上，否则 next/prev 会失效）
+   */
+  static _msClaim(target, state) {
+    if (!Awdio._msEnabled || !Awdio._msAvailable || !target) return;
+
+    let owner = Awdio._msOwner;
+    if (owner === target) {
+      Awdio._msApply(target, state);
+      return;
+    }
+    if (owner && owner._mode && owner._items && owner._items.indexOf(target) !== -1) {
+      return; // 归属队列，队列自己管理
+    }
+    // 显式 pauseOnBack:false 的实例不被自动接管政策暂停，故不抢接管权，
+    // 避免「锁屏按暂停 → 后台实例被莫名暂停」
+    if (state === 'playing' && target._pauseOnBack === false) return;
+
+    Awdio._msOwner = target;
+    Awdio._msApply(target, state || 'playing');
+  }
+
+  /** 实例/管理器暂停时调用 */
+  static _msRelease(target) {
+    if (Awdio._msOwner !== target) return;
+    if (!Awdio._msAvailable) return;
+    // 队列/并行模式由管理器接管，实例自身的 pause 不应改写 playbackState
+    if (target && target._mode && Awdio._msOwner === target) {
+      // 管理器：直接按状态同步
+      if (target.playing) {
+        Awdio._msApply(target, 'playing');
+      } else {
+        Awdio._msApply(target, 'paused');
+      }
+      return;
+    }
+    // 实例：只要还有其它实例在播（如 playAll 并行组），维持 playing
+    let othersPlaying = false;
+    for (let inst of Awdio._instances.values()) {
+      if (inst !== target && inst.playing) { othersPlaying = true; break; }
+    }
+    Awdio._msApply(target, othersPlaying ? 'playing' : 'paused');
+  }
+
+  /** 实例/管理器停止时调用 */
+  static _msStop(target) {
+    if (Awdio._msOwner !== target) return;
+    Awdio._msOwner = null;
+    Awdio._msClearPlaybackState();
+  }
+
+  /** 仅清空 playbackState，保留 metadata（厂商 UI 上更干净） */
+  static _msClearPlaybackState() {
+    if (!Awdio._msAvailable) return;
+    try { navigator.mediaSession.playbackState = 'none'; } catch (e) {}
+  }
+
+  /** 完全清除 mediaSession 接管 */
+  static _msClear() {
+    if (!Awdio._msAvailable) return;
+    let owner = Awdio._msOwner;
+    if (owner && owner._msHandlers) {
+      let ms = navigator.mediaSession;
+      Object.keys(owner._msHandlers).forEach(action => {
+        if (owner._msHandlers[action] === true) {
+          try { ms.setActionHandler(action, null); } catch (e) {}
+        }
+      });
+      owner._msHandlers = null;
+    }
+    Awdio._msOwner = null;
+    try {
+      navigator.mediaSession.metadata = null;
+      navigator.mediaSession.playbackState = 'none';
+    } catch (e) {}
+  }
+
+  /** 当前是否处于「播放被暂停」状态（供 _msRelease 判断） */
+  static _msSyncOwner() {
+    if (!Awdio._msEnabled || !Awdio._msOwner) return;
+    let owner = Awdio._msOwner;
+    Awdio._msApply(owner, owner.playing ? 'playing' : 'paused');
+  }
+
   // ==================== 构造函数 ====================
 
   constructor(arg1, arg2) {
@@ -985,6 +1298,18 @@ class Awdio extends _AwdioBase {
     this._pitch = opts.pitch != null ? Math.max(0.1, Math.min(10, opts.pitch)) : 1;
     this._reverse = opts.reverse || false;
     this._pauseOnBack = opts.pauseOnBack !== undefined ? opts.pauseOnBack : true;
+
+    // MediaSession 元数据（null 表示未显式设置，走全局默认 / 自动推导）
+    this._msMeta = null;
+    this._msTitle = null;
+    this._msArtist = null;
+    this._msAlbum = null;
+    this._msArtwork = null;
+    this._msHandlers = null;
+    if (opts.mediaSession !== undefined && opts.mediaSession !== null) {
+      this.mediaSession(opts.mediaSession);
+    }
+
     this._cache = opts.cache !== undefined ? !!opts.cache : true; // 是否参与全局音频缓存
     // HTML5 Audio 判断：合成音波强制 false；其余按 _x（data URI 强制 false，网络 URL 默认 true）
     let _isSynth = !!(this._formula || this._type);
@@ -2016,6 +2341,8 @@ class Awdio extends _AwdioBase {
         console.warn('Awdio: HTML5 音频播放失败', e);
         this._ac('error', { error: e, src: this._src });
       });
+      Awdio._msUserPaused = false;
+      Awdio._msClaim(this, 'playing');
       // clip 时长限制：到时间自动停止
       if (clipDuration != null && this._repeat !== Infinity) {
         if (this._htmlClipTimer) clearTimeout(this._htmlClipTimer);
@@ -2100,6 +2427,8 @@ class Awdio extends _AwdioBase {
     this._pausedAt = null;
 
     this._ac('play', { source });
+    Awdio._msUserPaused = false;
+    Awdio._msClaim(this, 'playing');
 
     let onEnd = () => {
       let idx = this._activeSources.indexOf(source);
@@ -2117,6 +2446,8 @@ class Awdio extends _AwdioBase {
           let looped = this._repeat !== Infinity && this._repeat > 1;
           this._ac('end', { count: this._repeatCount, total: this._repeat, repeated: looped });
           this._ae();
+          // 队列/并行模式由管理器接管 mediaSession，实例自身播完时不清空
+          Awdio._msRelease(this);
           // 非循环非多音模式：播放完毕断开全局输出，释放音频图资源
           if (this._repeat !== Infinity && !this._poly) {
             this._y();
@@ -2214,6 +2545,56 @@ class Awdio extends _AwdioBase {
     this._activeSources = [];
   }
 
+  // ==================== MediaSession 元数据 ====================
+
+  /**
+   * 设置/获取本实例的媒体元数据（锁屏、通知栏、耳机遥控显示的信息）
+   *
+   * - 不传参：返回当前元数据（未设置则返回 null）
+   * - 传 null / false：清除本实例元数据（不再参与自动推导）
+   * - 传对象：写入并立即同步（若本实例正在播放）
+   *
+   * 未设置的字段会回退到 Awdio.setMediaSession() 的全局默认值，
+   * 再回退到自动推导（文件名 / 波形类型 / 实例名）。
+   *
+   * artwork 使用绝对 URL 或 data URI；blob: URL 在多数系统界面无法渲染。
+   *
+   * 示例：music.mediaSession({ title: '夜曲', artist: 'Chopin', album: 'Nocturnes' })
+   *       music.mediaSession({ artwork: 'https://cdn.example.com/cover.jpg' })
+   *       music.mediaSession()   // 读取
+   *       music.mediaSession(null) // 清除
+   */
+  mediaSession(opts) {
+    if (this._destroyed) return this;
+
+    if (opts === undefined) {
+      return this._msMeta;
+    }
+    if (opts === null || opts === false) {
+      this._msMeta = null;
+      this._msTitle = null;
+      this._msArtist = null;
+      this._msAlbum = null;
+      this._msArtwork = null;
+      if (Awdio._msOwner === this) Awdio._msApply(this);
+      return this;
+    }
+    if (typeof opts === 'string') {
+      this._msTitle = opts;
+      this._msMeta = Object.assign({}, this._msMeta, { title: opts });
+    } else if (typeof opts === 'object') {
+      this._msMeta = Object.assign({}, this._msMeta, opts);
+      if (opts.title !== undefined)  this._msTitle  = opts.title;
+      if (opts.artist !== undefined) this._msArtist = opts.artist;
+      if (opts.album !== undefined)  this._msAlbum  = opts.album;
+      if (opts.artwork !== undefined) this._msArtwork = opts.artwork;
+      if (opts.silence === true) this._msMeta = null;
+    }
+    // 若本实例持有接管权，立即刷新
+    if (Awdio._msOwner === this) Awdio._msApply(this);
+    return this;
+  }
+
   // ==================== 公共播放控制 ====================
 
   play(arg) {
@@ -2256,6 +2637,7 @@ class Awdio extends _AwdioBase {
 
     this._av();
     this._ac('pause');
+    Awdio._msRelease(this);
     return this;
   }
 
@@ -2276,6 +2658,7 @@ class Awdio extends _AwdioBase {
     this._ac('stop');
     // 停止后断开全局输出，释放音频图资源
     this._y();
+    Awdio._msStop(this);
     return this;
   }
 
@@ -2541,6 +2924,9 @@ class Awdio extends _AwdioBase {
         v = { ...this._params };
       } else if (k === 'clip') {
         v = this._clip ? { ...this._clip } : null;
+      } else if (k === 'mediaSession') {
+        // 深拷贝，避免 clone() 与原实例共享同一元数据对象
+        v = this._msMeta ? { ...this._msMeta } : null;
       } else {
         v = spec.read ? spec.read(this) : this['_' + k];
       }
@@ -4075,6 +4461,8 @@ class Awdio extends _AwdioBase {
     this._bq();
     this._bn();
     Awdio._instances.delete(this._name);
+    // 若本实例正接管 mediaSession，销毁后释放接管权
+    if (Awdio._msOwner === this) Awdio._msStop(this);
 
     this._ac('destroy', { name: this._name });
     this._events = {};
@@ -4110,6 +4498,8 @@ class _AwdioManager extends _AwdioBase {
     this._currentEndHandler = null; // 当前播放项的 end 监听（供 next/prev 移除）
     this._events = {};
     this._perItemDelays = []; // 逐项延迟（毫秒），与 _items 一一对应
+    this._msMeta = null;      // MediaSession 元数据（覆盖单项）
+    this._msHandlers = null;  // 已绑定的媒体键处理器
 
     // autoplay
     if (this._autoplay && this._items.length > 0) {
@@ -4286,6 +4676,9 @@ class _AwdioManager extends _AwdioBase {
     item.on('end', onEnd);
     item.play();
     this._ac('play', { index: this._currentIndex, instance: item });
+    // 队列接管 mediaSession：next/prev/seekto 全部绑到管理器
+    Awdio._msUserPaused = false;
+    Awdio._msClaim(this, 'playing');
   }
 
   // ==================== 队列导航 ====================
@@ -4557,6 +4950,56 @@ class _AwdioManager extends _AwdioBase {
 
   get playing() {
     return this._playing && !this._paused && !this._stopped;
+  }
+
+  // ==================== MediaSession 支撑 ====================
+
+  /**
+   * 转发到当前播放项：媒体键 seek 用
+   * 管理器自身没有 seek 语义，故代理给正在播放的实例
+   */
+  seek(time) {
+    let cur = this._currentPlaying;
+    if (!cur && this._mode === 'parallel') {
+      cur = this.playingAudio;
+      if (Array.isArray(cur)) cur = cur[0];
+    }
+    if (cur && cur.seek) cur.seek(time);
+    return this;
+  }
+
+  /** 当前播放位置（秒），代理到正在播放的实例 */
+  get currentTime() {
+    let cur = this._currentPlaying;
+    if (!cur && this._mode === 'parallel') {
+      cur = this.playingAudio;
+      if (Array.isArray(cur)) cur = cur[0];
+    }
+    return cur ? cur.currentTime : 0;
+  }
+
+  /** 当前曲目时长（秒），代理到正在播放的实例 */
+  get duration() {
+    let cur = this._currentPlaying;
+    if (!cur && this._mode === 'parallel') {
+      cur = this.playingAudio;
+      if (Array.isArray(cur)) cur = cur[0];
+    }
+    return cur ? cur.duration : 0;
+  }
+
+  /** 队列级媒体元数据（覆盖单项元数据，供锁屏显示「第 n/m 首」等） */
+  mediaSession(opts) {
+    if (opts === undefined) return this._msMeta || null;
+    if (opts === null || opts === false) {
+      this._msMeta = null;
+    } else if (typeof opts === 'string') {
+      this._msMeta = Object.assign({}, this._msMeta, { title: opts });
+    } else if (typeof opts === 'object') {
+      this._msMeta = Object.assign({}, this._msMeta, opts);
+    }
+    if (Awdio._msOwner === this) Awdio._msApply(this);
+    return this;
   }
 }
 
