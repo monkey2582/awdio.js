@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
  * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
- * @version 4.0.0
+ * @version 4.1.0
  */
 !(function(root,factory){
   if (typeof define === 'function' && define.amd) {
@@ -52,6 +52,10 @@ class _AwdioBase {
    * @param {number} [waitTime=0] - 延迟多少毫秒后触发（从 end 时刻起算）
    * @returns {this}
    *
+   * 注意：本方法不是 Promise 的 then —— 不返回新 Promise、不接收 onRejected，
+   *      且返回 this 使其具备 thenable「外形」，在 Promise 链中可能被误判为
+   *      thenable 而导致挂起。如需 Promise 语义请用 toPromise()。
+   *
    * 示例：new Awdio('sine').then(() => console.log('播完了'))
    *       Awdio.queue(a, b).then(() => next(), 500)
    */
@@ -59,6 +63,66 @@ class _AwdioBase {
     if (typeof fn !== 'function') return this;
     this._thenCallbacks.push({ fn, waitTime: Math.max(0, waitTime || 0) });
     return this;
+  }
+
+  /**
+   * then 的语义化别名：明确表达「播放完成后执行」，避免与 Promise 混淆
+   * @param {Function} fn - 回调函数，接收 this 作为上下文
+   * @param {number} [waitTime=0] - 延迟多少毫秒后触发
+   * @returns {this}
+   *
+   * 示例：new Awdio('sine').after(() => console.log('播完了'))
+   */
+  after(fn, waitTime = 0) {
+    return this.then(fn, waitTime);
+  }
+
+  /** onEnd 是 after 的别名（更贴近 'end' 事件语义） */
+  onEnd(fn, waitTime = 0) {
+    return this.then(fn, waitTime);
+  }
+
+  /**
+   * 返回一个真正的 Promise，在播放完成（end）时 resolve
+   *
+   * 与 then() 的区别：返回标准 Promise，可 await、可链式 .then/.catch，
+   * 不会污染 Promise 链的 thenable 判定。
+   *
+   * ⚠️ 设计约束：Awdio 实例自带 then 方法，符合 thenable 规范外形。
+   * 按 Promise 解析规则，只要把实例交给 resolve()（或被链式 .then 返回），
+   * 就会触发「thenable 采纳」，转而等待实例自身的 then 回调 —— 而该 then
+   * 要等播放结束才触发，于是 Promise 永久挂起。
+   * 因此本方法 resolve 的是一个**原始值**，实例需通过传入回调获取。
+   *
+   * @param {number} [timeout] - 可选超时（毫秒），超时同样 resolve
+   * @param {Function} [onDone] - 可选：结束时回调，参数为实例本身
+   * @returns {Promise<true>} 播放结束时 resolve 为 true
+   *
+   * 示例：await new Awdio('beep.mp3').play().toPromise()
+   *       await Awdio.queue(a, b).play().toPromise(5000)
+   *       new Awdio('a.mp3').toPromise(0, self => self.stop())
+   */
+  toPromise(timeout, onDone) {
+    let self = this;
+    return new Promise(resolve => {
+      let done = false;
+      let timer = null;
+      let finish = () => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        if (typeof onDone === 'function') {
+          try { onDone.call(self, self); } catch (e) { console.error('Awdio toPromise error:', e); }
+        }
+        resolve(true);          // 只 resolve 原始值，规避 thenable 采纳
+      };
+      if (!self._thenCallbacks) self._thenCallbacks = [];
+      self._thenCallbacks.push({ fn: finish, waitTime: 0 });
+      if (timeout != null && timeout > 0) {
+        timer = setTimeout(finish, timeout);
+        if (self._thenTimers) self._thenTimers.push(timer);
+      }
+    });
   }
 
   /** 触发所有 then 回调（内部使用，'end' 时调用） */
@@ -684,14 +748,38 @@ class Awdio extends _AwdioBase {
   }
 
   /**
+   * 判断是否为「优先走 Web Audio 全量解码」的小体积无损/未压缩格式。
+   * 这些格式体积小、解码快，且常需要接 Web Audio 效果链，
+   * 走 HTML5 反而失去效果器能力，故默认回退 WebAudio。
+   */
+  static _ag(str) {
+    if (typeof str !== 'string') return false;
+    // 去掉 query / hash 后再看扩展名（/a.wav?v=2）
+    let path = str.split('#')[0].split('?')[0].toLowerCase();
+    return /\.(wav|wave|ogg|oga|opus|flac)$/.test(path);
+  }
+
+  /**
    * 判断是否应使用 HTML5 AudioElement 播放
+   *
+   * 判定顺序：
+   *   1. data URI → 始终强制 WebAudio（无需网络请求）
+   *   2. 显式传入 html 选项 → 以显式值为准
+   *   3. 小体积/未压缩格式（wav/ogg/flac…） → WebAudio
+   *   4. 其余（含相对路径、同域路径、无扩展名 URL） → HTML5 Audio
+   *
+   * 说明：相对路径与无扩展名 URL 是本地文件/同域资源的常见用法，
+   * 走 HTML5 可流式播放，避免「整段 fetch + decodeAudioData」造成
+   * 的数秒首播延迟与整段缓冲的内存开销。
+   *
    * @param {string|null} src - 音频源
-   * @param {boolean} [explicitHtml] - 显式 html 选项；data URI 始终强制 WebAudio
+   * @param {boolean} [explicitHtml] - 显式 html 选项
    */
   static _x(src, explicitHtml) {
     if (Awdio._ak(src)) return false;
     if (explicitHtml !== undefined) return !!explicitHtml;
-    return !!(Awdio._am(src) && !Awdio._ak(src));
+    if (Awdio._ag(src)) return false;
+    return true;
   }
 
   static _an(str) {
@@ -939,6 +1027,7 @@ class Awdio extends _AwdioBase {
     this._wasPausedByGlobal = false;
     this._isLoading = false;
     this._releasing = false;
+    this._seeking = false;        // seek 期间为 true，令 _bg() 跳过 release 调度
     this._releaseTimeoutId = null;
     this._reversedBuffer = null;
     this._htmlClipTimer = null; // HTML5 clip 超时定时器
@@ -1804,14 +1893,21 @@ class Awdio extends _AwdioBase {
         case 'synth_pad':
           sample = (Math.sin(2 * Math.PI * freq * t) * 0.4 + Math.sin(2 * Math.PI * freq * 1.005 * t) * 0.3 + Math.sin(2 * Math.PI * freq * 2.01 * t) * 0.2 + Math.sin(2 * Math.PI * freq * 0.5 * t) * 0.1) * 0.7;
           break;
-        case 'supersaw':
+        case 'supersaw': {
+          // 7 个锯齿（中心 + ±3 对），detune 系数 0.010 →
+          // 最外侧 ±30.4 cents，总跨度约 103 cents，略宽于原版
+          // （0.008 / 83 cents ≈ Roland JP-8000 的 ±40 cents），
+          // 在保留经典质感的同时让 detune 更易听出。
+          // 若需更宽的颗粒感可上调至 0.012（约 124 cents），
+          // 不建议超过 0.012 —— 再宽就不再是 supersaw 而是失谐和弦了。
           sample = 0;
           for (let d = -3; d <= 3; d++) {
-            let dp = (freq * (1 + d * 0.008) * t) % 1;
+            let dp = (freq * (1 + d * 0.010) * t) % 1;
             sample += (2 * (dp - 0.5)) * (1 - Math.abs(d) * 0.15);
           }
           sample *= 0.2;
           break;
+        }
         case 'sub_bass':
           sample = (Math.sin(2 * Math.PI * freq * t) * 0.7 + Math.sin(2 * Math.PI * freq * 0.5 * t) * 0.3) * Math.min(1, t * 50);
           break;
@@ -2091,7 +2187,10 @@ class Awdio extends _AwdioBase {
     }
 
     // ADSR 释放阶段
-    if (this._envelopeNode && this._envelope && this._activeSources.length > 0 && !this._releasing) {
+    // 注：seek 触发的停止（_seeking）走硬切分支——seek 语义是「立刻跳转」，
+    // 不再调度 release 淡出，否则会在旧位置拖出一条尾音再跳走
+    if (this._envelopeNode && this._envelope && this._activeSources.length > 0
+        && !this._releasing && !this._seeking) {
       this._releasing = true;
       let now = this._ctx.currentTime;
       this._envelopeNode.gain.cancelScheduledValues(now);
@@ -2192,7 +2291,15 @@ class Awdio extends _AwdioBase {
       let wasDone = this._repeatDone;
       this._repeat = 1;             // 防止 seek 期间误触重播
       this._repeatDone = true;
-      this._bg();
+      // seek 是「内部停止」：若正处在 envelope release 中，
+      // 标记 _seeking 让 _bg() 走「立即静音后硬切」而非再次调度 release，
+      // 但仍复用 _bg() 统一的收尾逻辑（清理 source、必要时清 _releasing）
+      this._seeking = true;
+      try {
+        this._bg();
+      } finally {
+        this._seeking = false;
+      }
       this._pausedAt = seconds;
       this._aw();
       this._repeat = wasRepeat;
@@ -3951,6 +4058,20 @@ class Awdio extends _AwdioBase {
     if (this._pannerNode) this._pannerNode.disconnect();
     if (this._analyserNode) this._analyserNode.disconnect();
     this._gainNode.disconnect();
+
+    // 清理实例设备输出（_d() 内部会清理，但 destroy 不经过 _d()，
+    // 若用户设过 setOutput，此处不清理会导致 <audio> 残留在 DOM
+    // 且 srcObject 持续拉流）
+    if (this._deviceOutputs) {
+      this._deviceOutputs.forEach(o => {
+        try { o.audioEl.pause(); o.audioEl.srcObject = null; o.audioEl.remove(); } catch (e) {}
+        try { o.destNode.disconnect(); } catch (e) {}
+      });
+      this._deviceOutputs = null;
+    }
+    // 使在途的 _d() await 失效，避免其继续写入已被清空的列表
+    this._outputToken = (this._outputToken || 0) + 1;
+
     this._bq();
     this._bn();
     Awdio._instances.delete(this._name);

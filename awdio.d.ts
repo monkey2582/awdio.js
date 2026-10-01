@@ -1,7 +1,7 @@
 /**
  * Awdio - 轻量级 Web Audio 音频库
  * 支持合成波形、公式自定义声音、3D 空间音频、网络/本地音频、队列播放、链式调用等
- * @version 4.0.0
+ * @version 4.1.0
  */
 
 declare class Awdio {
@@ -211,10 +211,51 @@ declare class Awdio {
    * @param fn - 回调函数，this 指向当前实例
    * @param waitTime - 延迟多少毫秒后触发（从 end 时刻起算，默认 0）
    *
+   * ⚠️ 注意：本方法**不是** Promise 的 then —— 不返回新 Promise、不接收
+   * onRejected，且返回 this 使其具备 thenable 外形，在 Promise 链中可能被
+   * 误判为 thenable 而永久挂起。需要 Promise 语义请使用 toPromise()。
+   *
    * 示例：new Awdio('sine').then(() => console.log('播完了'))
    *       new Awdio('sine').then(() => next(), 500)  // 播完后延迟 500ms 执行
    */
   then(fn: (self: Awdio) => void, waitTime?: number): this;
+
+  /**
+   * then 的语义化别名：明确表达「播放完成后执行」，避免与 Promise 混淆
+   * @param fn - 回调函数，this 指向当前实例
+   * @param waitTime - 延迟多少毫秒后触发（默认 0）
+   * @returns this
+   *
+   * 示例：new Awdio('sine').after(() => console.log('播完了'))
+   */
+  after(fn: (self: Awdio) => void, waitTime?: number): this;
+
+  /**
+   * after 的别名（更贴近 'end' 事件语义）
+   * @param fn - 回调函数，this 指向当前实例
+   * @param waitTime - 延迟多少毫秒后触发（默认 0）
+   * @returns this
+   */
+  onEnd(fn: (self: Awdio) => void, waitTime?: number): this;
+
+  /**
+   * 返回一个真正的 Promise，在播放完成（end）时 resolve
+   *
+   * 与 then() 的区别：返回标准 Promise，可 await、可链式 .then/.catch。
+   *
+   * ⚠️ 由于实例自身是 thenable（带 then 方法），Promise 解析过程不得接触
+   * 实例本身，否则会触发 thenable 采纳导致永久挂起。因此本方法
+   * **resolve 为 true（原始值）**，实例请通过 onDone 回调获取。
+   *
+   * @param timeout - 可选超时（毫秒），超时后同样 resolve（不 reject）
+   * @param onDone - 可选：结束时回调，参数为实例本身
+   * @returns Promise<true>
+   *
+   * 示例：await new Awdio('beep.mp3').play().toPromise()
+   *       await Awdio.queue(a, b).play().toPromise(5000)
+   *       new Awdio('a.mp3').toPromise(0, self => self.stop())
+   */
+  toPromise(timeout?: number, onDone?: (self: Awdio) => void): Promise<true>;
 
   // ==================== 循环 / 重复 ====================
 
@@ -903,7 +944,17 @@ interface AwdioOptions {
   reverse?: boolean;
   /** 
    * 是否使用 HTML5 AudioElement 播放（默认自动判断）
-   * 音波合成/Data URI 强制 false；网络 URL 默认 true；本地路径默认 false 但显式 true 有效
+   *
+   * 判定顺序：
+   *   1. 音波合成（type/formula）→ 强制 false（必须走 Web Audio 合成链）
+   *   2. data URI → 强制 false（无需网络请求，直接解码）
+   *   3. 小体积/未压缩格式（.wav/.wave/.ogg/.oga/.opus/.flac）→ false
+   *   4. 其余（网络 URL、相对路径、同域路径、无扩展名 URL）→ true
+   *
+   * 相对路径与同域资源同样默认走 HTML5，可边下边播；
+   * 若走 Web Audio 则需「整段 fetch + decodeAudioData」，
+   * 大文件会有数秒首播延迟且整段缓冲区常驻内存。
+   *
    * 设置为 true 可绕过 CORS 跨域限制，但无法使用 Web Audio 音效（reverb、filter 等）
    * HTML5 模式下 clip 片段和 output 设备路由同样生效
    * queue/playAll 中传入字符串 URL 会自动创建 html:true 的实例
@@ -941,10 +992,43 @@ interface AwdioManager {
    * @param fn - 回调函数，this 指向当前管理器
    * @param waitTime - 延迟多少毫秒后触发（从 end 时刻起算，默认 0）
    *
+   * ⚠️ 与实例的 then 一样，本方法不是 Promise 的 then：返回 this，
+   * 具备 thenable 外形。需要 Promise 语义请使用 toPromise()。
+   *
    * 示例：Awdio.queue(a, b).then(() => console.log('队列播完了'))
    *       Awdio.queue(a, b).then(() => next(), 300)
    */
   then(fn: (self: AwdioManager) => void, waitTime?: number): this;
+
+  /**
+   * then 的语义化别名：明确表达「播放完成后执行」
+   * @param fn - 回调函数，this 指向当前管理器
+   * @param waitTime - 延迟多少毫秒后触发（默认 0）
+   * @returns this
+   */
+  after(fn: (self: AwdioManager) => void, waitTime?: number): this;
+
+  /**
+   * after 的别名（更贴近 'end' 事件语义）
+   * @param fn - 回调函数，this 指向当前管理器
+   * @param waitTime - 延迟多少毫秒后触发（默认 0）
+   * @returns this
+   */
+  onEnd(fn: (self: AwdioManager) => void, waitTime?: number): this;
+
+  /**
+   * 返回一个真正的 Promise，在整组播放完成（end）时 resolve
+   *
+   * ⚠️ 管理器同样是 thenable，故本方法 **resolve 为 true（原始值）**，
+   * 实例请通过 onDone 回调获取，避免 thenable 采纳导致永久挂起。
+   *
+   * @param timeout - 可选超时（毫秒），超时后同样 resolve（不 reject）
+   * @param onDone - 可选：结束时回调，参数为管理器本身
+   * @returns Promise<true>
+   *
+   * 示例：await Awdio.queue(a, b).play().toPromise()
+   */
+  toPromise(timeout?: number, onDone?: (self: AwdioManager) => void): Promise<true>;
 
   /**
    * 设置/获取整个队列的循环方式（单一 API，按类型判断）
